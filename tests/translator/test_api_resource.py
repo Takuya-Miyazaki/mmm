@@ -1,12 +1,12 @@
 import json
-import os
-
 from unittest import TestCase
-from mock import MagicMock, patch
-from tests.translator.helpers import get_template_parameter_values
-from samtranslator.translator.transform import transform
+from unittest.mock import MagicMock, patch
+
 from samtranslator.model.apigateway import ApiGatewayDeployment
+from samtranslator.translator.transform import transform
+
 from tests.plugins.application.test_serverless_app_plugin import mock_get_region
+from tests.translator.helpers import get_template_parameter_values
 
 mock_policy_loader = MagicMock()
 mock_policy_loader.load.return_value = {
@@ -122,7 +122,7 @@ class TestApiGatewayDeploymentResource(TestCase):
         deployment.make_auto_deployable(stage, swagger=swagger)
 
         self.assertEqual(deployment.logical_id, id_val)
-        self.assertEqual(deployment.Description, "RestApi deployment id: {}".format(full_hash))
+        self.assertEqual(deployment.Description, f"RestApi deployment id: {full_hash}")
 
         LogicalIdGeneratorMock.assert_called_once_with(prefix, str(swagger))
         generator_mock.gen.assert_called_once_with()

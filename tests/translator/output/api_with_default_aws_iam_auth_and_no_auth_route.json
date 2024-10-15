@@ -1,13 +1,126 @@
 {
   "Resources": {
-    "MyFunctionWithAwsIamAuth": {
-      "Type": "AWS::Lambda::Function",
+    "MyApiWithAwsIamAuth": {
       "Properties": {
-        "Handler": "index.handler",
+        "Body": {
+          "info": {
+            "title": {
+              "Ref": "AWS::StackName"
+            },
+            "version": "1.0"
+          },
+          "paths": {
+            "/": {
+              "get": {
+                "responses": {},
+                "security": [
+                  {
+                    "NONE": []
+                  }
+                ],
+                "x-amazon-apigateway-integration": {
+                  "httpMethod": "POST",
+                  "type": "aws_proxy",
+                  "uri": {
+                    "Fn::Sub": "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MyFunctionWithAwsIamAuth.Arn}/invocations"
+                  }
+                }
+              },
+              "post": {
+                "responses": {},
+                "security": [
+                  {
+                    "AWS_IAM": []
+                  }
+                ],
+                "x-amazon-apigateway-integration": {
+                  "credentials": "arn:aws:iam::*:user/*",
+                  "httpMethod": "POST",
+                  "type": "aws_proxy",
+                  "uri": {
+                    "Fn::Sub": "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MyFunctionWithAwsIamAuth.Arn}/invocations"
+                  }
+                }
+              }
+            },
+            "/any/iam": {
+              "x-amazon-apigateway-any-method": {
+                "responses": {},
+                "security": [
+                  {
+                    "AWS_IAM": []
+                  }
+                ],
+                "x-amazon-apigateway-integration": {
+                  "credentials": "arn:aws:iam::*:user/*",
+                  "httpMethod": "POST",
+                  "type": "aws_proxy",
+                  "uri": {
+                    "Fn::Sub": "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MyFunctionWithAwsIamAuth.Arn}/invocations"
+                  }
+                }
+              }
+            },
+            "/any/none": {
+              "x-amazon-apigateway-any-method": {
+                "responses": {},
+                "security": [
+                  {
+                    "NONE": []
+                  }
+                ],
+                "x-amazon-apigateway-integration": {
+                  "httpMethod": "POST",
+                  "type": "aws_proxy",
+                  "uri": {
+                    "Fn::Sub": "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MyFunctionWithAwsIamAuth.Arn}/invocations"
+                  }
+                }
+              }
+            }
+          },
+          "securityDefinitions": {
+            "AWS_IAM": {
+              "in": "header",
+              "name": "Authorization",
+              "type": "apiKey",
+              "x-amazon-apigateway-authtype": "awsSigv4"
+            }
+          },
+          "swagger": "2.0"
+        }
+      },
+      "Type": "AWS::ApiGateway::RestApi"
+    },
+    "MyApiWithAwsIamAuthDeployment093beda14c": {
+      "Properties": {
+        "Description": "RestApi deployment id: 093beda14c569aec5939596a6b12b8fda3695560",
+        "RestApiId": {
+          "Ref": "MyApiWithAwsIamAuth"
+        },
+        "StageName": "Stage"
+      },
+      "Type": "AWS::ApiGateway::Deployment"
+    },
+    "MyApiWithAwsIamAuthProdStage": {
+      "Properties": {
+        "DeploymentId": {
+          "Ref": "MyApiWithAwsIamAuthDeployment093beda14c"
+        },
+        "RestApiId": {
+          "Ref": "MyApiWithAwsIamAuth"
+        },
+        "StageName": "Prod"
+      },
+      "Type": "AWS::ApiGateway::Stage"
+    },
+    "MyFunctionWithAwsIamAuth": {
+      "Properties": {
         "Code": {
           "S3Bucket": "bucket",
           "S3Key": "key"
         },
+        "Handler": "index.handler",
         "Role": {
           "Fn::GetAtt": [
             "MyFunctionWithAwsIamAuthRole",
@@ -17,147 +130,100 @@
         "Runtime": "nodejs12.x",
         "Tags": [
           {
-            "Value": "SAM",
-            "Key": "lambda:createdBy"
+            "Key": "lambda:createdBy",
+            "Value": "SAM"
           }
         ]
-      }
+      },
+      "Type": "AWS::Lambda::Function"
     },
-    "MyFunctionWithAwsIamAuthMyApiWithNoAuthPermissionProd": {
-      "Type": "AWS::Lambda::Permission",
+    "MyFunctionWithAwsIamAuthMyApiWithAwsIamAuthAnyMethodPermissionProd": {
       "Properties": {
         "Action": "lambda:InvokeFunction",
-        "Principal": "apigateway.amazonaws.com",
         "FunctionName": {
           "Ref": "MyFunctionWithAwsIamAuth"
         },
+        "Principal": "apigateway.amazonaws.com",
         "SourceArn": {
           "Fn::Sub": [
-            "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${__ApiId__}/${__Stage__}/GET/",
+            "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${__ApiId__}/${__Stage__}/*/any/iam",
             {
-              "__Stage__": "*",
               "__ApiId__": {
                 "Ref": "MyApiWithAwsIamAuth"
-              }
+              },
+              "__Stage__": "*"
             }
           ]
         }
-      }
+      },
+      "Type": "AWS::Lambda::Permission"
     },
     "MyFunctionWithAwsIamAuthMyApiWithAwsIamAuthPermissionProd": {
-      "Type": "AWS::Lambda::Permission",
       "Properties": {
         "Action": "lambda:InvokeFunction",
-        "Principal": "apigateway.amazonaws.com",
         "FunctionName": {
           "Ref": "MyFunctionWithAwsIamAuth"
         },
+        "Principal": "apigateway.amazonaws.com",
         "SourceArn": {
           "Fn::Sub": [
             "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${__ApiId__}/${__Stage__}/POST/",
             {
-              "__Stage__": "*",
               "__ApiId__": {
                 "Ref": "MyApiWithAwsIamAuth"
-              }
+              },
+              "__Stage__": "*"
             }
           ]
         }
-      }
+      },
+      "Type": "AWS::Lambda::Permission"
     },
-    "MyApiWithAwsIamAuth": {
-      "Type": "AWS::ApiGateway::RestApi",
+    "MyFunctionWithAwsIamAuthMyApiWithNoAuthAnyMethodPermissionProd": {
       "Properties": {
-        "Body": {
-          "info": {
-            "version": "1.0",
-            "title": {
-              "Ref": "AWS::StackName"
-            }
-          },
-          "paths": {
-            "/": {
-              "post": {
-                "x-amazon-apigateway-integration": {
-                  "httpMethod": "POST",
-                  "type": "aws_proxy",
-                  "uri": {
-                    "Fn::Sub": "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MyFunctionWithAwsIamAuth.Arn}/invocations"
-                  },
-                  "credentials": "arn:aws:iam::*:user/*"
-                },
-                "security": [
-                  {
-                    "AWS_IAM": []
-                  }
-                ],
-                "responses": {}
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "MyFunctionWithAwsIamAuth"
+        },
+        "Principal": "apigateway.amazonaws.com",
+        "SourceArn": {
+          "Fn::Sub": [
+            "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${__ApiId__}/${__Stage__}/*/any/none",
+            {
+              "__ApiId__": {
+                "Ref": "MyApiWithAwsIamAuth"
               },
-              "get": {
-                "x-amazon-apigateway-integration": {
-                  "httpMethod": "POST",
-                  "type": "aws_proxy",
-                  "uri": {
-                    "Fn::Sub": "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MyFunctionWithAwsIamAuth.Arn}/invocations"
-                  }
-                },
-                "security": [
-                  {
-                    "NONE": []
-                  }
-                ],
-                "responses": {}
-              }
+              "__Stage__": "*"
             }
-          },
-          "swagger": "2.0",
-          "securityDefinitions": {
-            "AWS_IAM": {
-              "in": "header",
-              "type": "apiKey",
-              "name": "Authorization",
-              "x-amazon-apigateway-authtype": "awsSigv4"
-            }
-          }
+          ]
         }
-      }
+      },
+      "Type": "AWS::Lambda::Permission"
     },
-    "MyApiWithAwsIamAuthProdStage": {
-      "Type": "AWS::ApiGateway::Stage",
+    "MyFunctionWithAwsIamAuthMyApiWithNoAuthPermissionProd": {
       "Properties": {
-        "DeploymentId": {
-          "Ref": "MyApiWithAwsIamAuthDeploymentd4892df344"
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "MyFunctionWithAwsIamAuth"
         },
-        "RestApiId": {
-          "Ref": "MyApiWithAwsIamAuth"
-        },
-        "StageName": "Prod"
-      }
-    },
-    "MyApiWithAwsIamAuthDeploymentd4892df344": {
-      "Type": "AWS::ApiGateway::Deployment",
-      "Properties": {
-        "RestApiId": {
-          "Ref": "MyApiWithAwsIamAuth"
-        },
-        "Description": "RestApi deployment id: d4892df3448eaab6a467b44ffd4ed87f18f9a5d8",
-        "StageName": "Stage"
-      }
+        "Principal": "apigateway.amazonaws.com",
+        "SourceArn": {
+          "Fn::Sub": [
+            "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${__ApiId__}/${__Stage__}/GET/",
+            {
+              "__ApiId__": {
+                "Ref": "MyApiWithAwsIamAuth"
+              },
+              "__Stage__": "*"
+            }
+          ]
+        }
+      },
+      "Type": "AWS::Lambda::Permission"
     },
     "MyFunctionWithAwsIamAuthRole": {
-      "Type": "AWS::IAM::Role",
       "Properties": {
-        "ManagedPolicyArns": [
-          "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-        ],
-        "Tags": [
-          {
-            "Value": "SAM",
-            "Key": "lambda:createdBy"
-          }
-        ],
         "AssumeRolePolicyDocument": {
-          "Version": "2012-10-17",
           "Statement": [
             {
               "Action": [
@@ -170,9 +236,20 @@
                 ]
               }
             }
-          ]
-        }
-      }
+          ],
+          "Version": "2012-10-17"
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        ],
+        "Tags": [
+          {
+            "Key": "lambda:createdBy",
+            "Value": "SAM"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Role"
     }
   }
 }

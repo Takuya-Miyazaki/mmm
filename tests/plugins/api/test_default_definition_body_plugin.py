@@ -1,5 +1,5 @@
-from mock import Mock, patch
 from unittest import TestCase
+from unittest.mock import Mock, patch
 
 from samtranslator.plugins.api.default_definition_body_plugin import DefaultDefinitionBodyPlugin
 from samtranslator.public.plugins import BasePlugin
@@ -27,7 +27,6 @@ class TestDefaultDefinitionBodyPlugin_on_before_transform_template(TestCase):
 
     @patch("samtranslator.plugins.api.default_definition_body_plugin.SamTemplate")
     def test_must_process_functions(self, SamTemplateMock):
-
         template_dict = {"a": "b"}
         api_resources = [("id1", ApiResource()), ("id2", ApiResource()), ("id3", ApiResource())]
 
@@ -45,6 +44,6 @@ class TestDefaultDefinitionBodyPlugin_on_before_transform_template(TestCase):
         sam_template.iterate.assert_any_call({"AWS::Serverless::HttpApi"})
 
 
-class ApiResource(object):
+class ApiResource:
     def __init__(self):
         self.properties = {}

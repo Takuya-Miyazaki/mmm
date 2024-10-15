@@ -1,30 +1,40 @@
-from six import string_types
 import json
+from abc import ABCMeta
+from typing import Any, Dict, List, Optional, Union, cast
 
-from samtranslator.model import PropertyType, ResourceMacro
-from samtranslator.model.events import EventsRule
-from samtranslator.model.iam import IAMRole, IAMRolePolicies
-from samtranslator.model.types import dict_of, is_str, is_type, list_of, one_of
-from samtranslator.model.intrinsics import fnSub
-from samtranslator.translator import logical_id_generator
-from samtranslator.model.exceptions import InvalidEventException, InvalidResourceException
+from samtranslator.metrics.method_decorator import cw_timer
+from samtranslator.model import Property, PropertyType, Resource, ResourceMacro
 from samtranslator.model.eventbridge_utils import EventBridgeRuleUtils
-from samtranslator.translator.arn_generator import ArnGenerator
+from samtranslator.model.events import EventsRule, generate_valid_target_id
+from samtranslator.model.eventsources.push import Api as PushApi
+from samtranslator.model.exceptions import InvalidEventException
+from samtranslator.model.iam import IAMRole, IAMRolePolicies
+from samtranslator.model.intrinsics import fnSub
+from samtranslator.model.stepfunctions.resources import StepFunctionsStateMachine
+from samtranslator.model.types import IS_BOOL, IS_DICT, IS_STR, PassThrough
 from samtranslator.swagger.swagger import SwaggerEditor
-from samtranslator.open_api.open_api import OpenApiEditor
+from samtranslator.translator import logical_id_generator
 
 CONDITION = "Condition"
+SFN_EVETSOURCE_METRIC_PREFIX = "SFNEventSource"
+EVENT_RULE_SFN_TARGET_SUFFIX = "StepFunctionsTarget"
 
 
-class EventSource(ResourceMacro):
+class EventSource(ResourceMacro, metaclass=ABCMeta):
     """Base class for event sources for SAM State Machine.
 
     :cvar str principal: The AWS service principal of the source service.
     """
 
-    principal = None
+    # Note(xinhol): `EventSource` should have been an abstract class. Disabling the type check for the next
+    # line to avoid any potential behavior change.
+    # TODO: Make `EventSource` an abstract class and not giving `principal` initial value.
+    principal: str = None  # type: ignore
+    relative_id: str  # overriding the Optional[str]: for event, relative id is not None
 
-    def _generate_logical_id(self, prefix, suffix, resource_type):
+    Target: Optional[Dict[str, str]]
+
+    def _generate_logical_id(self, prefix, suffix, resource_type):  # type: ignore[no-untyped-def]
         """Helper utility to generate a logicial ID for a new resource
 
         :param string prefix: Prefix to use for the logical ID of the resource
@@ -37,13 +47,17 @@ class EventSource(ResourceMacro):
         if prefix is None:
             prefix = self.logical_id
         if suffix.isalnum():
-            logical_id = prefix + resource_type + suffix
-        else:
-            generator = logical_id_generator.LogicalIdGenerator(prefix + resource_type, suffix)
-            logical_id = generator.gen()
-        return logical_id
+            return prefix + resource_type + suffix
+        generator = logical_id_generator.LogicalIdGenerator(prefix + resource_type, suffix)
+        return generator.gen()
 
-    def _construct_role(self, resource, permissions_boundary=None, prefix=None, suffix=""):
+    def _construct_role(
+        self,
+        resource: StepFunctionsStateMachine,
+        permissions_boundary: Optional[str],
+        prefix: Optional[str],
+        suffix: str = "",
+    ) -> IAMRole:
         """Constructs the IAM Role resource allowing the event service to invoke
         the StartExecution API of the state machine resource it is associated with.
 
@@ -55,14 +69,14 @@ class EventSource(ResourceMacro):
         :returns: the IAM Role resource
         :rtype: model.iam.IAMRole
         """
-        role_logical_id = self._generate_logical_id(prefix=prefix, suffix=suffix, resource_type="Role")
+        role_logical_id = self._generate_logical_id(prefix=prefix, suffix=suffix, resource_type="Role")  # type: ignore[no-untyped-call]
         event_role = IAMRole(role_logical_id, attributes=resource.get_passthrough_resource_attributes())
         event_role.AssumeRolePolicyDocument = IAMRolePolicies.construct_assume_role_policy_for_service_principal(
             self.principal
         )
         state_machine_arn = resource.get_runtime_attr("arn")
         event_role.Policies = [
-            IAMRolePolicies.step_functions_start_execution_role_policy(state_machine_arn, role_logical_id)
+            IAMRolePolicies.step_functions_start_execution_role_policy(state_machine_arn, role_logical_id)  # type: ignore[no-untyped-call]
         ]
 
         if permissions_boundary:
@@ -77,61 +91,112 @@ class Schedule(EventSource):
     resource_type = "Schedule"
     principal = "events.amazonaws.com"
     property_types = {
-        "Schedule": PropertyType(True, is_str()),
-        "Input": PropertyType(False, is_str()),
-        "Enabled": PropertyType(False, is_type(bool)),
-        "Name": PropertyType(False, is_str()),
-        "Description": PropertyType(False, is_str()),
-        "DeadLetterConfig": PropertyType(False, is_type(dict)),
-        "RetryPolicy": PropertyType(False, is_type(dict)),
+        "Schedule": PropertyType(True, IS_STR),
+        "Input": PropertyType(False, IS_STR),
+        "Enabled": PropertyType(False, IS_BOOL),
+        "State": PropertyType(False, IS_STR),
+        "Name": PropertyType(False, IS_STR),
+        "Description": PropertyType(False, IS_STR),
+        "DeadLetterConfig": PropertyType(False, IS_DICT),
+        "RetryPolicy": PropertyType(False, IS_DICT),
+        "Target": Property(False, IS_DICT),
+        "RoleArn": Property(False, IS_STR),
     }
 
-    def to_cloudformation(self, resource, **kwargs):
+    Schedule: PassThrough
+    Input: Optional[PassThrough]
+    Enabled: Optional[bool]
+    State: Optional[PassThrough]
+    Name: Optional[PassThrough]
+    Description: Optional[PassThrough]
+    DeadLetterConfig: Optional[Dict[str, Any]]
+    RetryPolicy: Optional[PassThrough]
+    Target: Optional[PassThrough]
+    RoleArn: Optional[PassThrough]
+
+    @cw_timer(prefix=SFN_EVETSOURCE_METRIC_PREFIX)
+    def to_cloudformation(self, resource, **kwargs):  # type: ignore[no-untyped-def]
         """Returns the EventBridge Rule and IAM Role to which this Schedule event source corresponds.
 
         :param dict kwargs: no existing resources need to be modified
         :returns: a list of vanilla CloudFormation Resources, to which this Schedule event expands
         :rtype: list
         """
-        resources = []
+        resources: List[Any] = []
 
         permissions_boundary = kwargs.get("permissions_boundary")
 
-        events_rule = EventsRule(self.logical_id)
+        passthrough_resource_attributes = resource.get_passthrough_resource_attributes()
+        events_rule = EventsRule(self.logical_id, attributes=passthrough_resource_attributes)
         resources.append(events_rule)
 
         events_rule.ScheduleExpression = self.Schedule
+
+        if self.State and self.Enabled is not None:
+            raise InvalidEventException(self.relative_id, "State and Enabled Properties cannot both be specified.")
+
+        if self.State:
+            events_rule.State = self.State
+
         if self.Enabled is not None:
             events_rule.State = "ENABLED" if self.Enabled else "DISABLED"
+
         events_rule.Name = self.Name
         events_rule.Description = self.Description
-        if CONDITION in resource.resource_attributes:
-            events_rule.set_resource_attribute(CONDITION, resource.resource_attributes[CONDITION])
 
-        role = self._construct_role(resource, permissions_boundary)
-        resources.append(role)
+        role: Union[IAMRole, str, Dict[str, Any]]
+        if self.RoleArn is None:
+            role = self._construct_role(resource, permissions_boundary, prefix=None)
+            resources.append(role)
+        else:
+            role = self.RoleArn
 
         source_arn = events_rule.get_runtime_attr("arn")
         dlq_queue_arn = None
         if self.DeadLetterConfig is not None:
-            EventBridgeRuleUtils.validate_dlq_config(self.logical_id, self.DeadLetterConfig)
-            dlq_queue_arn, dlq_resources = EventBridgeRuleUtils.get_dlq_queue_arn_and_resources(self, source_arn)
+            EventBridgeRuleUtils.validate_dlq_config(self.logical_id, self.DeadLetterConfig)  # type: ignore[no-untyped-call]
+            dlq_queue_arn, dlq_resources = EventBridgeRuleUtils.get_dlq_queue_arn_and_resources(  # type: ignore[no-untyped-call]
+                self, source_arn, passthrough_resource_attributes
+            )
             resources.extend(dlq_resources)
         events_rule.Targets = [self._construct_target(resource, role, dlq_queue_arn)]
 
         return resources
 
-    def _construct_target(self, resource, role, dead_letter_queue_arn=None):
-        """Constructs the Target property for the EventBridge Rule.
+    def _construct_target(
+        self,
+        resource: StepFunctionsStateMachine,
+        role: Union[IAMRole, str, Dict[str, Any]],
+        dead_letter_queue_arn: Optional[str],
+    ) -> Dict[str, Any]:
+        """_summary_
 
-        :returns: the Target property
-        :rtype: dict
+        Parameters
+        ----------
+        resource
+            StepFunctionsState machine resource to be generated
+        role
+            The role to be used by the Schedule event resource either generated or user provides arn
+        dead_letter_queue_arn
+            Dead letter queue associated with the resource
+
+        Returns
+        -------
+            The Target property
         """
+        target_id = (
+            self.Target["Id"]
+            if self.Target and "Id" in self.Target
+            else generate_valid_target_id(self.logical_id, EVENT_RULE_SFN_TARGET_SUFFIX)
+        )
+
         target = {
             "Arn": resource.get_runtime_attr("arn"),
-            "Id": self.logical_id + "StepFunctionsTarget",
-            "RoleArn": role.get_runtime_attr("arn"),
+            "Id": target_id,
         }
+
+        target["RoleArn"] = role.get_runtime_attr("arn") if isinstance(role, IAMRole) else role
+
         if self.Input is not None:
             target["Input"] = self.Input
 
@@ -150,15 +215,31 @@ class CloudWatchEvent(EventSource):
     resource_type = "CloudWatchEvent"
     principal = "events.amazonaws.com"
     property_types = {
-        "EventBusName": PropertyType(False, is_str()),
-        "Pattern": PropertyType(False, is_type(dict)),
-        "Input": PropertyType(False, is_str()),
-        "InputPath": PropertyType(False, is_str()),
-        "DeadLetterConfig": PropertyType(False, is_type(dict)),
-        "RetryPolicy": PropertyType(False, is_type(dict)),
+        "EventBusName": PropertyType(False, IS_STR),
+        "RuleName": PropertyType(False, IS_STR),
+        "Pattern": PropertyType(False, IS_DICT),
+        "Input": PropertyType(False, IS_STR),
+        "InputPath": PropertyType(False, IS_STR),
+        "DeadLetterConfig": PropertyType(False, IS_DICT),
+        "RetryPolicy": PropertyType(False, IS_DICT),
+        "State": PropertyType(False, IS_STR),
+        "Target": Property(False, IS_DICT),
+        "InputTransformer": PropertyType(False, IS_DICT),
     }
 
-    def to_cloudformation(self, resource, **kwargs):
+    EventBusName: Optional[PassThrough]
+    RuleName: Optional[PassThrough]
+    Pattern: Optional[PassThrough]
+    Input: Optional[PassThrough]
+    InputPath: Optional[PassThrough]
+    DeadLetterConfig: Optional[Dict[str, Any]]
+    RetryPolicy: Optional[PassThrough]
+    State: Optional[PassThrough]
+    Target: Optional[PassThrough]
+    InputTransformer: Optional[PassThrough]
+
+    @cw_timer(prefix=SFN_EVETSOURCE_METRIC_PREFIX)
+    def to_cloudformation(self, resource, **kwargs):  # type: ignore[no-untyped-def]
         """Returns the CloudWatch Events/EventBridge Rule and IAM Role to which this
         CloudWatch Events/EventBridge event source corresponds.
 
@@ -166,41 +247,55 @@ class CloudWatchEvent(EventSource):
         :returns: a list of vanilla CloudFormation Resources, to which this CloudWatch Events/EventBridge event expands
         :rtype: list
         """
-        resources = []
+        resources: List[Any] = []
 
         permissions_boundary = kwargs.get("permissions_boundary")
 
-        events_rule = EventsRule(self.logical_id)
+        passthrough_resource_attributes = resource.get_passthrough_resource_attributes()
+        events_rule = EventsRule(self.logical_id, attributes=passthrough_resource_attributes)
         events_rule.EventBusName = self.EventBusName
         events_rule.EventPattern = self.Pattern
-        if CONDITION in resource.resource_attributes:
-            events_rule.set_resource_attribute(CONDITION, resource.resource_attributes[CONDITION])
+        events_rule.Name = self.RuleName
+
+        if self.State:
+            events_rule.State = self.State
 
         resources.append(events_rule)
 
-        role = self._construct_role(resource, permissions_boundary)
+        role = self._construct_role(
+            resource,
+            permissions_boundary,
+            prefix=None,
+        )
         resources.append(role)
 
         source_arn = events_rule.get_runtime_attr("arn")
         dlq_queue_arn = None
         if self.DeadLetterConfig is not None:
-            EventBridgeRuleUtils.validate_dlq_config(self.logical_id, self.DeadLetterConfig)
-            dlq_queue_arn, dlq_resources = EventBridgeRuleUtils.get_dlq_queue_arn_and_resources(self, source_arn)
+            EventBridgeRuleUtils.validate_dlq_config(self.logical_id, self.DeadLetterConfig)  # type: ignore[no-untyped-call]
+            dlq_queue_arn, dlq_resources = EventBridgeRuleUtils.get_dlq_queue_arn_and_resources(  # type: ignore[no-untyped-call]
+                self, source_arn, passthrough_resource_attributes
+            )
             resources.extend(dlq_resources)
 
-        events_rule.Targets = [self._construct_target(resource, role, dlq_queue_arn)]
+        events_rule.Targets = [self._construct_target(resource, role, dlq_queue_arn)]  # type: ignore[no-untyped-call]
 
         return resources
 
-    def _construct_target(self, resource, role, dead_letter_queue_arn=None):
+    def _construct_target(self, resource, role, dead_letter_queue_arn=None):  # type: ignore[no-untyped-def]
         """Constructs the Target property for the CloudWatch Events/EventBridge Rule.
 
         :returns: the Target property
         :rtype: dict
         """
+        target_id = (
+            self.Target["Id"]
+            if self.Target and "Id" in self.Target
+            else generate_valid_target_id(self.logical_id, EVENT_RULE_SFN_TARGET_SUFFIX)
+        )
         target = {
             "Arn": resource.get_runtime_attr("arn"),
-            "Id": self.logical_id + "StepFunctionsTarget",
+            "Id": target_id,
             "RoleArn": role.get_runtime_attr("arn"),
         }
         if self.Input is not None:
@@ -214,6 +309,9 @@ class CloudWatchEvent(EventSource):
 
         if self.RetryPolicy is not None:
             target["RetryPolicy"] = self.RetryPolicy
+
+        if self.InputTransformer is not None:
+            target["InputTransformer"] = self.InputTransformer
 
         return target
 
@@ -230,60 +328,31 @@ class Api(EventSource):
     resource_type = "Api"
     principal = "apigateway.amazonaws.com"
     property_types = {
-        "Path": PropertyType(True, is_str()),
-        "Method": PropertyType(True, is_str()),
+        "Path": PropertyType(True, IS_STR),
+        "Method": PropertyType(True, IS_STR),
         # Api Event sources must "always" be paired with a Serverless::Api
-        "RestApiId": PropertyType(True, is_str()),
-        "Stage": PropertyType(False, is_str()),
-        "Auth": PropertyType(False, is_type(dict)),
+        "RestApiId": PropertyType(True, IS_STR),
+        "Stage": PropertyType(False, IS_STR),
+        "Auth": PropertyType(False, IS_DICT),
+        "UnescapeMappingTemplate": Property(False, IS_BOOL),
     }
 
-    def resources_to_link(self, resources):
+    Path: str
+    Method: str
+    RestApiId: str
+    Stage: Optional[str]
+    Auth: Optional[Dict[str, Any]]
+    UnescapeMappingTemplate: Optional[bool]
+
+    def resources_to_link(self, resources: Dict[str, Any]) -> Dict[str, Any]:
         """
         If this API Event Source refers to an explicit API resource, resolve the reference and grab
         necessary data from the explicit API
         """
+        return PushApi.resources_to_link_for_rest_api(resources, self.relative_id, self.RestApiId)
 
-        rest_api_id = self.RestApiId
-        if isinstance(rest_api_id, dict) and "Ref" in rest_api_id:
-            rest_api_id = rest_api_id["Ref"]
-
-        # If RestApiId is a resource in the same template, then we try find the StageName by following the reference
-        # Otherwise we default to a wildcard. This stage name is solely used to construct the permission to
-        # allow this stage to invoke the State Machine. If we are unable to resolve the stage name, we will
-        # simply permit all stages to invoke this State Machine
-        # This hack is necessary because customers could use !ImportValue, !Ref or other intrinsic functions which
-        # can be sometimes impossible to resolve (ie. when it has cross-stack references)
-        permitted_stage = "*"
-        stage_suffix = "AllStages"
-        explicit_api = None
-        if isinstance(rest_api_id, string_types):
-
-            if (
-                rest_api_id in resources
-                and "Properties" in resources[rest_api_id]
-                and "StageName" in resources[rest_api_id]["Properties"]
-            ):
-
-                explicit_api = resources[rest_api_id]["Properties"]
-                permitted_stage = explicit_api["StageName"]
-
-                # Stage could be a intrinsic, in which case leave the suffix to default value
-                if isinstance(permitted_stage, string_types):
-                    stage_suffix = permitted_stage
-                else:
-                    stage_suffix = "Stage"
-
-            else:
-                # RestApiId is a string, not an intrinsic, but we did not find a valid API resource for this ID
-                raise InvalidEventException(
-                    self.relative_id,
-                    "RestApiId property of Api event must reference a valid resource in the same template.",
-                )
-
-        return {"explicit_api": explicit_api, "explicit_api_stage": {"suffix": stage_suffix}}
-
-    def to_cloudformation(self, resource, **kwargs):
+    @cw_timer(prefix=SFN_EVETSOURCE_METRIC_PREFIX)
+    def to_cloudformation(self, resource, **kwargs):  # type: ignore[no-untyped-def]
         """If the Api event source has a RestApi property, then simply return the IAM role resource
         allowing API Gateway to start the state machine execution. If no RestApi is provided, then
         additionally inject the path, method, and the x-amazon-apigateway-integration into the
@@ -297,7 +366,7 @@ class Api(EventSource):
         :returns: a list of vanilla CloudFormation Resources, to which this Api event expands
         :rtype: list
         """
-        resources = []
+        resources: List[Any] = []
 
         intrinsics_resolver = kwargs.get("intrinsics_resolver")
         permissions_boundary = kwargs.get("permissions_boundary")
@@ -306,16 +375,17 @@ class Api(EventSource):
             # Convert to lower case so that user can specify either GET or get
             self.Method = self.Method.lower()
 
-        role = self._construct_role(resource, permissions_boundary)
+        role = self._construct_role(resource, permissions_boundary, prefix=None)
         resources.append(role)
 
         explicit_api = kwargs["explicit_api"]
+        api_id = kwargs["api_id"]
         if explicit_api.get("__MANAGE_SWAGGER"):
-            self._add_swagger_integration(explicit_api, resource, role, intrinsics_resolver)
+            self._add_swagger_integration(explicit_api, api_id, resource, role, intrinsics_resolver)  # type: ignore[no-untyped-call]
 
         return resources
 
-    def _add_swagger_integration(self, api, resource, role, intrinsics_resolver):
+    def _add_swagger_integration(self, api, api_id, resource, role, intrinsics_resolver):  # type: ignore[no-untyped-def]
         """Adds the path and method for this Api event source to the Swagger body for the provided RestApi.
 
         :param model.apigateway.ApiGatewayRestApi rest_api: the RestApi to which the path and method should be added.
@@ -324,7 +394,6 @@ class Api(EventSource):
         if swagger_body is None:
             return
 
-        resource_arn = resource.get_runtime_attr("arn")
         integration_uri = fnSub("arn:${AWS::Partition}:apigateway:${AWS::Region}:states:action/StartExecution")
 
         editor = SwaggerEditor(swagger_body)
@@ -333,94 +402,41 @@ class Api(EventSource):
             # Cannot add the integration, if it is already present
             raise InvalidEventException(
                 self.relative_id,
-                'API method "{method}" defined multiple times for path "{path}".'.format(
-                    method=self.Method, path=self.Path
-                ),
+                f'API method "{self.Method}" defined multiple times for path "{self.Path}".',
             )
 
         condition = None
         if CONDITION in resource.resource_attributes:
             condition = resource.resource_attributes[CONDITION]
 
-        editor.add_state_machine_integration(
+        request_template = (
+            self._generate_request_template_unescaped(resource)
+            if self.UnescapeMappingTemplate
+            else self._generate_request_template(resource)
+        )
+
+        editor.add_state_machine_integration(  # type: ignore[no-untyped-call]
             self.Path,
             self.Method,
             integration_uri,
             role.get_runtime_attr("arn"),
-            self._generate_request_template(resource),
+            request_template,
             condition=condition,
         )
 
-        # Note: Refactor and combine the section below with the Api eventsource for functions
+        # self.Stage is not None as it is set in _get_permissions()
+        # before calling this method.
+        # TODO: refactor to remove this cast
+        stage = cast(str, self.Stage)
+
         if self.Auth:
-            method_authorizer = self.Auth.get("Authorizer")
-            api_auth = api.get("Auth")
-            api_auth = intrinsics_resolver.resolve_parameter_refs(api_auth)
-
-            if method_authorizer:
-                api_authorizers = api_auth and api_auth.get("Authorizers")
-
-                if method_authorizer != "AWS_IAM":
-                    if method_authorizer != "NONE" and not api_authorizers:
-                        raise InvalidEventException(
-                            self.relative_id,
-                            "Unable to set Authorizer [{authorizer}] on API method [{method}] for path [{path}] "
-                            "because the related API does not define any Authorizers.".format(
-                                authorizer=method_authorizer, method=self.Method, path=self.Path
-                            ),
-                        )
-
-                    if method_authorizer != "NONE" and not api_authorizers.get(method_authorizer):
-                        raise InvalidEventException(
-                            self.relative_id,
-                            "Unable to set Authorizer [{authorizer}] on API method [{method}] for path [{path}] "
-                            "because it wasn't defined in the API's Authorizers.".format(
-                                authorizer=method_authorizer, method=self.Method, path=self.Path
-                            ),
-                        )
-
-                    if method_authorizer == "NONE":
-                        if not api_auth or not api_auth.get("DefaultAuthorizer"):
-                            raise InvalidEventException(
-                                self.relative_id,
-                                "Unable to set Authorizer on API method [{method}] for path [{path}] because 'NONE' "
-                                "is only a valid value when a DefaultAuthorizer on the API is specified.".format(
-                                    method=self.Method, path=self.Path
-                                ),
-                            )
-
-            if self.Auth.get("AuthorizationScopes") and not isinstance(self.Auth.get("AuthorizationScopes"), list):
-                raise InvalidEventException(
-                    self.relative_id,
-                    "Unable to set Authorizer on API method [{method}] for path [{path}] because "
-                    "'AuthorizationScopes' must be a list of strings.".format(method=self.Method, path=self.Path),
-                )
-
-            apikey_required_setting = self.Auth.get("ApiKeyRequired")
-            apikey_required_setting_is_false = apikey_required_setting is not None and not apikey_required_setting
-            if apikey_required_setting_is_false and (not api_auth or not api_auth.get("ApiKeyRequired")):
-                raise InvalidEventException(
-                    self.relative_id,
-                    "Unable to set ApiKeyRequired [False] on API method [{method}] for path [{path}] "
-                    "because the related API does not specify any ApiKeyRequired.".format(
-                        method=self.Method, path=self.Path
-                    ),
-                )
-
-            if method_authorizer or apikey_required_setting is not None:
-                editor.add_auth_to_method(api=api, path=self.Path, method_name=self.Method, auth=self.Auth)
-
-            if self.Auth.get("ResourcePolicy"):
-                resource_policy = self.Auth.get("ResourcePolicy")
-                editor.add_resource_policy(
-                    resource_policy=resource_policy, path=self.Path, api_id=self.RestApiId.get("Ref"), stage=self.Stage
-                )
-                if resource_policy.get("CustomStatements"):
-                    editor.add_custom_statements(resource_policy.get("CustomStatements"))
+            PushApi.add_auth_to_swagger(
+                self.Auth, api, api_id, self.relative_id, self.Method, self.Path, stage, editor, intrinsics_resolver
+            )
 
         api["DefinitionBody"] = editor.swagger
 
-    def _generate_request_template(self, resource):
+    def _generate_request_template(self, resource: Resource) -> Dict[str, Any]:
         """Generates the Body mapping request template for the Api. This allows for the input
         request to the Api to be passed as the execution input to the associated state machine resource.
 
@@ -430,7 +446,7 @@ class Api(EventSource):
         :returns: a body mapping request which passes the Api input to the state machine execution
         :rtype: dict
         """
-        request_templates = {
+        return {
             "application/json": fnSub(
                 json.dumps(
                     {
@@ -440,4 +456,26 @@ class Api(EventSource):
                 )
             )
         }
-        return request_templates
+
+    def _generate_request_template_unescaped(self, resource: Resource) -> Dict[str, Any]:
+        """Generates the Body mapping request template for the Api. This allows for the input
+        request to the Api to be passed as the execution input to the associated state machine resource.
+
+        Unescapes single quotes such that it's valid JSON.
+
+        :param model.stepfunctions.resources.StepFunctionsStateMachine resource; the state machine
+                resource to which the Api event source must be associated
+
+        :returns: a body mapping request which passes the Api input to the state machine execution
+        :rtype: dict
+        """
+        return {
+            "application/json": fnSub(
+                # Need to unescape single quotes escaped by escapeJavaScript.
+                # Also the mapping template isn't valid JSON, so can't use json.dumps().
+                # See https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-mapping-template-reference.html#util-template-reference
+                """{"input": "$util.escapeJavaScript($input.json('$')).replaceAll("\\\\'","'")", "stateMachineArn": "${"""
+                + resource.logical_id
+                + """}"}"""
+            )
+        }

@@ -1,14 +1,12 @@
 from unittest import TestCase
-from mock import Mock, patch, ANY
+from unittest.mock import ANY, Mock, patch
 
+from samtranslator.policy_template_processor.exceptions import InsufficientParameterValues, InvalidParameterValues
 from samtranslator.policy_template_processor.template import Template
-from samtranslator.policy_template_processor.exceptions import InvalidParameterValues, InsufficientParameterValues
 
 
 class TestTemplateObject(TestCase):
-    @patch.object(Template, "check_parameters_exist")
-    def test_init_must_check_for_existence_of_all_parameters(self, check_parameters_exist_mock):
-
+    def test_init_must_check_for_existence_of_all_parameters(self):
         template_name = "template_name"
         parameters = {}
         template_definition = {"key": "value"}
@@ -18,10 +16,8 @@ class TestTemplateObject(TestCase):
         self.assertEqual(template.name, template_name)
         self.assertEqual(template.parameters, parameters)
         self.assertEqual(template.definition, template_definition)
-        check_parameters_exist_mock.assert_called_once_with(parameters, template_definition)
 
-    @patch.object(Template, "check_parameters_exist")
-    def test_from_dict_must_return_object(self, check_parameters_exist_mock):
+    def test_from_dict_must_return_object(self):
         template_name = "template_name"
         parameters = {"A": "B"}
         template_definition = {"key": "value"}
@@ -35,8 +31,7 @@ class TestTemplateObject(TestCase):
         self.assertEqual(template.parameters, parameters)
         self.assertEqual(template.definition, template_definition)
 
-    @patch.object(Template, "check_parameters_exist")
-    def test_from_dict_must_work_when_parameters_is_absent(self, check_parameters_exist_mock):
+    def test_from_dict_must_work_when_parameters_is_absent(self):
         template_name = "template_name"
         template_definition = {"key": "value"}
 
@@ -47,8 +42,7 @@ class TestTemplateObject(TestCase):
         self.assertEqual(template.parameters, {})  # Defaults to {}
         self.assertEqual(template.definition, template_definition)
 
-    @patch.object(Template, "check_parameters_exist")
-    def test_from_dict_must_work_when_template_definition_is_absent(self, check_parameters_exist_mock):
+    def test_from_dict_must_work_when_template_definition_is_absent(self):
         template_name = "template_name"
         parameters = {"key": "value"}
 
@@ -99,17 +93,14 @@ class TestTemplateObject(TestCase):
             template.missing_parameter_values(parameter_values)
 
     def test_is_valid_parameter_values_must_work(self):
-
         parameter_values = {"a": "b"}
         self.assertTrue(Template._is_valid_parameter_values(parameter_values))
 
     def test_is_valid_parameter_values_must_fail_for_none_value(self):
-
         parameter_values = None
         self.assertFalse(Template._is_valid_parameter_values(parameter_values))
 
     def test_is_valid_parameter_values_must_fail_for_non_dict(self):
-
         parameter_values = [1, 2, 3]
         self.assertFalse(Template._is_valid_parameter_values(parameter_values))
 
@@ -128,7 +119,7 @@ class TestTemplateObject(TestCase):
         result = template.to_statement(parameter_values)
 
         self.assertEqual(expected, result)
-        intrinsics_resolver_mock.assert_called_once_with(parameter_values, {"Ref": ANY})
+        intrinsics_resolver_mock.assert_called_once_with({"___SAM_POLICY_PARAMETER_param1": "b"}, {"Ref": ANY})
         resolver_instance_mock.resolve_parameter_refs.assert_called_once_with({"Statement": {"key": "value"}})
 
     @patch("samtranslator.policy_template_processor.template.IntrinsicsResolver")
@@ -145,7 +136,7 @@ class TestTemplateObject(TestCase):
         template.to_statement(parameter_values)
 
         # Intrinsics resolver must be called only with the parameters declared in the template
-        expected_parameter_values = {"param1": "b"}
+        expected_parameter_values = {"___SAM_POLICY_PARAMETER_param1": "b"}
         intrinsics_resolver_mock.assert_called_once_with(expected_parameter_values, ANY)
 
     @patch("samtranslator.policy_template_processor.template.IntrinsicsResolver")

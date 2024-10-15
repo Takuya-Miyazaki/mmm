@@ -22,8 +22,8 @@ Resources:
         }
       Runtime: nodejs12.x
       Policies:
-        - SQSSendMessagePolicy:
-            QueueName: !GetAtt MySqsQueue.QueueName
+      - SQSSendMessagePolicy:
+          QueueName: !GetAtt MySqsQueue.QueueName
       Events:
         Stream:
           Type: Kinesis
@@ -52,10 +52,29 @@ Resources:
             BisectBatchOnFunctionError: true
             MaximumRecordAgeInSeconds: 86400
             StartingPosition: TRIM_HORIZON
+            TumblingWindowInSeconds: 60
+            FunctionResponseTypes:
+            - ReportBatchItemFailures
             DestinationConfig:
               OnFailure:
                 Type: SQS
                 Destination: !GetAtt MySqsQueue.Arn
+        StreamEventWithoutDestinationConfigType:
+          Type: Kinesis
+          Properties:
+            Stream: !GetAtt KinesisStream1.Arn
+            MaximumBatchingWindowInSeconds: !Ref MyBatchingWindowParam
+            StartingPosition: LATEST
+            DestinationConfig:
+              OnFailure:
+                Destination: !Ref MySnsTopic
+        StreamEventWithEmptyDestinationConfig:
+          Type: Kinesis
+          Properties:
+            Stream: !GetAtt KinesisStream1.Arn
+            MaximumBatchingWindowInSeconds: !Ref MyBatchingWindowParam
+            StartingPosition: LATEST
+            DestinationConfig:
 
   KinesisStream:
     Type: AWS::Kinesis::Stream
@@ -70,11 +89,11 @@ Resources:
     Type: AWS::DynamoDB::Table
     Properties:
       AttributeDefinitions:
-        - AttributeName: id
-          AttributeType: S
+      - AttributeName: id
+        AttributeType: S
       KeySchema:
-        - AttributeName: id
-          KeyType: HASH
+      - AttributeName: id
+        KeyType: HASH
       ProvisionedThroughput:
         ReadCapacityUnits: 5
         WriteCapacityUnits: 5

@@ -3,6 +3,10 @@ AWSTemplateFormatVersion: '2010-09-09'
 Resources:
   AuthFunction:
     Type: AWS::Serverless::Function
+    Properties:
+      InlineCode: ''
+      Handler: index
+      Runtime: python3.9
   AccessingPartyAPI:
     Type: AWS::Serverless::Api
     Properties:
@@ -20,14 +24,14 @@ Resources:
         AddDefaultAuthorizerToCorsPreflight: false
       DefinitionBody:
         paths:
-          "/path":
+          /path:
             put:
               responses:
                 '201':
                   content:
                     application/json:
                       schema:
-                        "$ref": "abcd"
+                        $ref: abcd
               x-amazon-apigateway-integration:
                 contentHandling: CONVERT_TO_TEXT
                 responses:
@@ -47,7 +51,8 @@ Resources:
                       - status
                       type: object
               security:
-                CustomAuthorizer: []
+              # each item should be a dict
+              - CustomAuthorizer
 
         openapi: 3.0.3
         components:
@@ -60,11 +65,14 @@ Resources:
   AccessingPartyAPIFunction:
     Type: AWS::Serverless::Function
     Properties:
+      InlineCode: ''
+      Handler: index
+      Runtime: python3.9
       Events:
         PutReservation:
           Type: Api
           Properties:
-            Path: "/path"
+            Path: /path
             RestApiId:
               Ref: AccessingPartyAPI
             Method: put

@@ -1,28 +1,29 @@
-import json
-import itertools
-import os.path
 import hashlib
-import sys
-from functools import reduce, cmp_to_key
-
-from samtranslator.translator.translator import Translator, prepare_plugins, make_policy_template_for_function_plugin
-from samtranslator.parser.parser import Parser
-from samtranslator.model.exceptions import InvalidDocumentException, InvalidResourceException
-from samtranslator.model import Resource
-from samtranslator.model.sam_resources import SamSimpleTable
-from samtranslator.public.plugins import BasePlugin
-
-from tests.translator.helpers import get_template_parameter_values
-from tests.plugins.application.test_serverless_app_plugin import mock_get_region
-from samtranslator.yaml_helper import yaml_parse
-from parameterized import parameterized, param
+import itertools
+import json
+import os.path
+import re
+import time
+from functools import cmp_to_key, reduce
+from pathlib import Path
+from unittest import TestCase
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
-import yaml
-from unittest import TestCase
+from parameterized import parameterized
+from samtranslator.model import Resource
+from samtranslator.model.exceptions import InvalidDocumentException, InvalidResourceException
+from samtranslator.model.sam_resources import SamSimpleTable
+from samtranslator.parser.parser import Parser
+from samtranslator.public.plugins import BasePlugin
 from samtranslator.translator.transform import transform
-from mock import Mock, MagicMock, patch
+from samtranslator.translator.translator import Translator, make_policy_template_for_function_plugin, prepare_plugins
+from samtranslator.yaml_helper import yaml_parse
 
+from tests.plugins.application.test_serverless_app_plugin import mock_get_region
+from tests.translator.helpers import get_template_parameter_values
+
+PROJECT_ROOT = Path(__file__).parent.parent.parent
 BASE_PATH = os.path.dirname(__file__)
 INPUT_FOLDER = BASE_PATH + "/input"
 OUTPUT_FOLDER = BASE_PATH + "/output"
@@ -32,7 +33,18 @@ DO_NOT_SORT = ["Layers"]
 
 BASE_PATH = os.path.dirname(__file__)
 INPUT_FOLDER = os.path.join(BASE_PATH, "input")
+SUCCESS_FILES_NAMES_FOR_TESTING = [
+    os.path.splitext(f)[0]
+    for f in os.listdir(INPUT_FOLDER)
+    if not (f.startswith(("error_", "translate_", "feature_toggle_")))
+]
+ERROR_FILES_NAMES_FOR_TESTING = [os.path.splitext(f)[0] for f in os.listdir(INPUT_FOLDER) if f.startswith("error_")]
+FEATURE_TOGGLE_TESTING = [os.path.splitext(f)[0] for f in os.listdir(INPUT_FOLDER) if f.startswith("feature_toggle_")]
 OUTPUT_FOLDER = os.path.join(BASE_PATH, "output")
+
+
+def _parse_yaml(path):
+    return yaml_parse(PROJECT_ROOT.joinpath(path).read_text())
 
 
 def deep_sort_lists(value):
@@ -55,12 +67,8 @@ def deep_sort_lists(value):
     if isinstance(value, dict):
         return {k: deep_sort_lists(v) for k, v in value.items()}
     if isinstance(value, list):
-        if sys.version_info.major < 3:
-            # Py2 can sort lists with complex types like dictionaries
-            return sorted((deep_sort_lists(x) for x in value))
-        else:
-            # Py3 cannot sort lists with complex types. Hence a custom comparator function
-            return sorted((deep_sort_lists(x) for x in value), key=cmp_to_key(custom_list_data_comparator))
+        # Py3 cannot sort lists with complex types. Hence a custom comparator function
+        return sorted((deep_sort_lists(x) for x in value), key=cmp_to_key(custom_list_data_comparator))
     else:
         return value
 
@@ -100,15 +108,13 @@ def mock_sar_service_call(self, service_call_function, logical_id, *args):
     application_id = args[0]
     status = "ACTIVE"
     if application_id == "no-access":
-        raise InvalidResourceException(logical_id, "Cannot access application: {}.".format(application_id))
+        raise InvalidResourceException(logical_id, f"Cannot access application: {application_id}.")
     elif application_id == "non-existent":
-        raise InvalidResourceException(logical_id, "Cannot access application: {}.".format(application_id))
+        raise InvalidResourceException(logical_id, f"Cannot access application: {application_id}.")
     elif application_id == "invalid-semver":
-        raise InvalidResourceException(logical_id, "Cannot access application: {}.".format(application_id))
+        raise InvalidResourceException(logical_id, f"Cannot access application: {application_id}.")
     elif application_id == 1:
-        raise InvalidResourceException(
-            logical_id, "Type of property 'ApplicationId' is invalid.".format(application_id)
-        )
+        raise InvalidResourceException(logical_id, "Type of property 'ApplicationId' is invalid.")
     elif application_id == "preparing" and self._wait_for_template_active_status < 2:
         self._wait_for_template_active_status += 1
         self.SLEEP_TIME_SECONDS = 0
@@ -138,181 +144,125 @@ def mock_sar_service_call(self, service_call_function, logical_id, *args):
 # api and s3 location for explicit api.
 
 
-class TestTranslatorEndToEnd(TestCase):
+class AbstractTestTranslator(TestCase):
+    maxDiff = None
+
+    def _read_input(self, testcase):
+        manifest = yaml_parse(open(os.path.join(INPUT_FOLDER, testcase + ".yaml")))
+        # To uncover unicode-related bugs, convert dict to JSON string and parse JSON back to dict
+        return json.loads(json.dumps(manifest))
+
+    def _read_expected_output(self, testcase, partition):
+        partition_folder = partition if partition != "aws" else ""
+        expected_filepath = os.path.join(OUTPUT_FOLDER, partition_folder, testcase + ".json")
+        return json.load(open(expected_filepath))
+
+    def _compare_transform(self, manifest, expected, partition, region, enable_feature_toggle=False):
+        with patch("boto3.session.Session.region_name", region):
+            parameter_values = get_template_parameter_values()
+            mock_policy_loader = MagicMock()
+            mock_policy_loader.load.return_value = {
+                "AWSLambdaBasicExecutionRole": f"arn:{partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+                "AmazonDynamoDBFullAccess": f"arn:{partition}:iam::aws:policy/AmazonDynamoDBFullAccess",
+                "AmazonDynamoDBReadOnlyAccess": f"arn:{partition}:iam::aws:policy/AmazonDynamoDBReadOnlyAccess",
+                "AWSLambdaRole": f"arn:{partition}:iam::aws:policy/service-role/AWSLambdaRole",
+            }
+            if partition == "aws":
+                mock_policy_loader.load.return_value["AWSXrayWriteOnlyAccess"] = (
+                    "arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess"
+                )
+            else:
+                mock_policy_loader.load.return_value["AWSXRayDaemonWriteAccess"] = (
+                    f"arn:{partition}:iam::aws:policy/AWSXRayDaemonWriteAccess"
+                )
+
+            if enable_feature_toggle:
+                mock_feature_toggle = MagicMock()
+                mock_feature_toggle.is_enabled.return_value = True
+                output_fragment = transform(manifest, parameter_values, mock_policy_loader, mock_feature_toggle)
+            else:
+                output_fragment = transform(manifest, parameter_values, mock_policy_loader)
+
+        print(json.dumps(output_fragment, indent=2))
+
+        self.assertEqual(deep_sort_lists(output_fragment), deep_sort_lists(expected))
+
+    def _update_logical_id_hash(self, resources):
+        """
+        Brute force method for updating all APIGW Deployment LogicalIds and references to a consistent hash
+        """
+        output_resources = resources.get("Resources", {})
+        deployment_logical_id_dict = {}
+        rest_api_to_swagger_hash = {}
+        dict_of_things_to_delete = {}
+
+        # Find all RestApis in the template
+        for logical_id, resource_dict in output_resources.items():
+            if resource_dict.get("Type") == "AWS::ApiGateway::RestApi":
+                resource_properties = resource_dict.get("Properties", {})
+                if "Body" in resource_properties:
+                    self._generate_new_deployment_hash(
+                        logical_id, resource_properties.get("Body"), rest_api_to_swagger_hash
+                    )
+
+                elif "BodyS3Location" in resource_dict.get("Properties"):
+                    self._generate_new_deployment_hash(
+                        logical_id, resource_properties.get("BodyS3Location"), rest_api_to_swagger_hash
+                    )
+
+        # Collect all APIGW Deployments LogicalIds and generate the new ones
+        for logical_id, resource_dict in output_resources.items():
+            if resource_dict.get("Type") == "AWS::ApiGateway::Deployment":
+                resource_properties = resource_dict.get("Properties", {})
+
+                rest_id = resource_properties.get("RestApiId").get("Ref")
+
+                data_hash = rest_api_to_swagger_hash.get(rest_id)
+
+                description = resource_properties.get("Description")[: -len(data_hash)]
+
+                resource_properties["Description"] = description + data_hash
+
+                new_logical_id = logical_id[:-10] + data_hash[:10]
+
+                deployment_logical_id_dict[logical_id] = new_logical_id
+                dict_of_things_to_delete[logical_id] = (new_logical_id, resource_dict)
+
+        # Update References to APIGW Deployments
+        for logical_id, resource_dict in output_resources.items():
+            if resource_dict.get("Type") == "AWS::ApiGateway::Stage":
+                resource_properties = resource_dict.get("Properties", {})
+
+                rest_id = resource_properties.get("RestApiId", {}).get("Ref", "")
+
+                data_hash = rest_api_to_swagger_hash.get(rest_id)
+
+                deployment_id = resource_properties.get("DeploymentId", {}).get("Ref")
+                new_logical_id = deployment_logical_id_dict.get(deployment_id, "")[:-10]
+                new_logical_id = new_logical_id + data_hash[:10]
+
+                resource_properties.get("DeploymentId", {})["Ref"] = new_logical_id
+
+        # To avoid mutating the template while iterating, delete only after find everything to update
+        for logical_id_to_remove, tuple_to_add in dict_of_things_to_delete.items():
+            output_resources[tuple_to_add[0]] = tuple_to_add[1]
+            del output_resources[logical_id_to_remove]
+
+        # Update any Output References in the template
+        for _output_key, output_value in resources.get("Outputs", {}).items():
+            if output_value.get("Value").get("Ref") in deployment_logical_id_dict:
+                output_value["Value"]["Ref"] = deployment_logical_id_dict[output_value.get("Value").get("Ref")]
+
+    def _generate_new_deployment_hash(self, logical_id, dict_to_hash, rest_api_to_swagger_hash):
+        data_bytes = json.dumps(dict_to_hash, separators=(",", ":"), sort_keys=True).encode("utf8")
+        data_hash = hashlib.sha1(data_bytes).hexdigest()
+        rest_api_to_swagger_hash[logical_id] = data_hash
+
+
+class TestTranslatorEndToEnd(AbstractTestTranslator):
     @parameterized.expand(
         itertools.product(
-            [
-                "cognito_userpool_with_event",
-                "s3_with_condition",
-                "function_with_condition",
-                "basic_function",
-                "basic_function_withimageuri",
-                "basic_application",
-                "application_preparing_state",
-                "application_with_intrinsics",
-                "basic_layer",
-                "cloudwatchevent",
-                "eventbridgerule",
-                "eventbridgerule_with_dlq",
-                "eventbridgerule_with_retry_policy",
-                "eventbridgerule_schedule_properties",
-                "cloudwatch_logs_with_ref",
-                "cloudwatchlog",
-                "streams",
-                "sqs",
-                "amq",
-                "simpletable",
-                "simpletable_with_sse",
-                "implicit_api",
-                "explicit_api",
-                "api_description",
-                "api_endpoint_configuration",
-                "api_endpoint_configuration_with_vpcendpoint",
-                "api_with_auth_all_maximum",
-                "api_with_auth_all_minimum",
-                "api_with_auth_no_default",
-                "api_with_auth_with_default_scopes",
-                "api_with_auth_with_default_scopes_openapi",
-                "api_with_default_aws_iam_auth",
-                "api_with_default_aws_iam_auth_and_no_auth_route",
-                "api_with_method_aws_iam_auth",
-                "api_with_aws_iam_auth_overrides",
-                "api_with_method_settings",
-                "api_with_binary_media_types",
-                "api_with_binary_media_types_definition_body",
-                "api_with_minimum_compression_size",
-                "api_with_resource_refs",
-                "api_with_cors",
-                "api_with_cors_and_auth_no_preflight_auth",
-                "api_with_cors_and_auth_preflight_auth",
-                "api_with_cors_and_only_methods",
-                "api_with_cors_and_only_headers",
-                "api_with_cors_and_only_origins",
-                "api_with_cors_and_only_maxage",
-                "api_with_cors_and_only_credentials_false",
-                "api_with_cors_no_definitionbody",
-                "api_with_incompatible_stage_name",
-                "api_with_gateway_responses",
-                "api_with_gateway_responses_all",
-                "api_with_gateway_responses_minimal",
-                "api_with_gateway_responses_implicit",
-                "api_with_gateway_responses_string_status_code",
-                "api_cache",
-                "api_with_access_log_setting",
-                "api_with_canary_setting",
-                "api_with_xray_tracing",
-                "api_request_model",
-                "api_with_stage_tags",
-                "s3",
-                "s3_create_remove",
-                "s3_existing_lambda_notification_configuration",
-                "s3_existing_other_notification_configuration",
-                "s3_filter",
-                "s3_multiple_events_same_bucket",
-                "s3_multiple_functions",
-                "s3_with_dependsOn",
-                "sns",
-                "sns_sqs",
-                "sns_existing_sqs",
-                "sns_outside_sqs",
-                "sns_existing_other_subscription",
-                "sns_topic_outside_template",
-                "alexa_skill",
-                "alexa_skill_with_skill_id",
-                "iot_rule",
-                "layers_with_intrinsics",
-                "layers_all_properties",
-                "function_managed_inline_policy",
-                "unsupported_resources",
-                "intrinsic_functions",
-                "basic_function_with_tags",
-                "depends_on",
-                "function_event_conditions",
-                "function_with_dlq",
-                "function_with_kmskeyarn",
-                "function_with_alias",
-                "function_with_alias_intrinsics",
-                "function_with_custom_codedeploy_deployment_preference",
-                "function_with_custom_conditional_codedeploy_deployment_preference",
-                "function_with_disabled_deployment_preference",
-                "function_with_deployment_preference",
-                "function_with_deployment_preference_all_parameters",
-                "function_with_deployment_preference_from_parameters",
-                "function_with_deployment_preference_multiple_combinations",
-                "function_with_alias_and_event_sources",
-                "function_with_resource_refs",
-                "function_with_deployment_and_custom_role",
-                "function_with_deployment_no_service_role",
-                "function_with_global_layers",
-                "function_with_layers",
-                "function_with_many_layers",
-                "function_with_permissions_boundary",
-                "function_with_policy_templates",
-                "function_with_sns_event_source_all_parameters",
-                "function_with_conditional_managed_policy",
-                "function_with_conditional_managed_policy_and_ref_no_value",
-                "function_with_conditional_policy_template",
-                "function_with_conditional_policy_template_and_ref_no_value",
-                "function_with_request_parameters",
-                "function_with_signing_profile",
-                "global_handle_path_level_parameter",
-                "globals_for_function",
-                "globals_for_api",
-                "globals_for_simpletable",
-                "all_policy_templates",
-                "simple_table_ref_parameter_intrinsic",
-                "simple_table_with_table_name",
-                "function_concurrency",
-                "simple_table_with_extra_tags",
-                "explicit_api_with_invalid_events_config",
-                "no_implicit_api_with_serverless_rest_api_resource",
-                "implicit_api_with_serverless_rest_api_resource",
-                "implicit_api_with_auth_and_conditions_max",
-                "implicit_api_with_many_conditions",
-                "implicit_and_explicit_api_with_conditions",
-                "inline_precedence",
-                "api_with_cors_and_conditions_no_definitionbody",
-                "api_with_auth_and_conditions_all_max",
-                "api_with_apikey_default_override",
-                "api_with_apikey_required",
-                "api_with_path_parameters",
-                "function_with_event_source_mapping",
-                "function_with_event_dest",
-                "function_with_event_dest_basic",
-                "function_with_event_dest_conditional",
-                "api_with_usageplans",
-                "api_with_usageplans_intrinsics",
-                "state_machine_with_inline_definition",
-                "state_machine_with_tags",
-                "state_machine_with_inline_definition_intrinsics",
-                "state_machine_with_role",
-                "state_machine_with_inline_policies",
-                "state_machine_with_sam_policy_templates",
-                "state_machine_with_definition_S3_string",
-                "state_machine_with_definition_S3_object",
-                "state_machine_with_definition_substitutions",
-                "state_machine_with_standard_logging",
-                "state_machine_with_express_logging",
-                "state_machine_with_managed_policy",
-                "state_machine_with_condition",
-                "state_machine_with_schedule",
-                "state_machine_with_schedule_dlq_retry_policy",
-                "state_machine_with_cwe",
-                "state_machine_with_eb_retry_policy",
-                "state_machine_with_eb_dlq",
-                "state_machine_with_eb_dlq_generated",
-                "state_machine_with_explicit_api",
-                "state_machine_with_implicit_api",
-                "state_machine_with_implicit_api_globals",
-                "state_machine_with_api_authorizer",
-                "state_machine_with_api_authorizer_maximum",
-                "state_machine_with_api_resource_policy",
-                "state_machine_with_api_auth_default_scopes",
-                "state_machine_with_condition_and_events",
-                "state_machine_with_xray",
-                "function_with_file_system_config",
-                "state_machine_with_permissions_boundary",
-            ],
+            SUCCESS_FILES_NAMES_FOR_TESTING,
             [
                 ("aws", "ap-southeast-1"),
                 ("aws-cn", "cn-north-1"),
@@ -324,40 +274,41 @@ class TestTranslatorEndToEnd(TestCase):
         "samtranslator.plugins.application.serverless_app_plugin.ServerlessAppPlugin._sar_service_call",
         mock_sar_service_call,
     )
-    @patch("botocore.client.ClientEndpointBridge._check_default_region", mock_get_region)
-    def test_transform_success(self, testcase, partition_with_region):
+    @patch("samtranslator.translator.arn_generator._get_region_from_session")
+    def test_transform_success(self, testcase, partition_with_region, mock_get_region_from_session):
         partition = partition_with_region[0]
         region = partition_with_region[1]
+        mock_get_region_from_session.return_value = region
 
-        manifest = yaml_parse(open(os.path.join(INPUT_FOLDER, testcase + ".yaml"), "r"))
-        # To uncover unicode-related bugs, convert dict to JSON string and parse JSON back to dict
-        manifest = json.loads(json.dumps(manifest))
-        partition_folder = partition if partition != "aws" else ""
-        expected_filepath = os.path.join(OUTPUT_FOLDER, partition_folder, testcase + ".json")
-        expected = json.load(open(expected_filepath, "r"))
+        manifest = self._read_input(testcase)
+        expected = self._read_expected_output(testcase, partition)
 
-        with patch("boto3.session.Session.region_name", region):
-            parameter_values = get_template_parameter_values()
-            mock_policy_loader = MagicMock()
-            mock_policy_loader.load.return_value = {
-                "AWSLambdaBasicExecutionRole": "arn:{}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole".format(
-                    partition
-                ),
-                "AmazonDynamoDBFullAccess": "arn:{}:iam::aws:policy/AmazonDynamoDBFullAccess".format(partition),
-                "AmazonDynamoDBReadOnlyAccess": "arn:{}:iam::aws:policy/AmazonDynamoDBReadOnlyAccess".format(partition),
-                "AWSLambdaRole": "arn:{}:iam::aws:policy/service-role/AWSLambdaRole".format(partition),
-            }
+        self._compare_transform(manifest, expected, partition, region)
 
-            output_fragment = transform(manifest, parameter_values, mock_policy_loader)
+    @parameterized.expand(
+        itertools.product(
+            FEATURE_TOGGLE_TESTING,
+            [
+                ("aws", "ap-southeast-1"),
+                ("aws-cn", "cn-north-1"),
+                ("aws-us-gov", "us-gov-west-1"),
+            ],  # Run all the above tests against each of the list of partitions to test against
+        )
+    )
+    @patch(
+        "samtranslator.plugins.application.serverless_app_plugin.ServerlessAppPlugin._sar_service_call",
+        mock_sar_service_call,
+    )
+    @patch("samtranslator.translator.arn_generator._get_region_from_session")
+    def test_transform_feature_toggle(self, testcase, partition_with_region, mock_get_region_from_session):
+        partition = partition_with_region[0]
+        region = partition_with_region[1]
+        mock_get_region_from_session.return_value = region
 
-        print(json.dumps(output_fragment, indent=2))
+        manifest = self._read_input(testcase)
+        expected = self._read_expected_output(testcase, partition)
 
-        # Only update the deployment Logical Id hash in Py3.
-        if sys.version_info.major >= 3:
-            self._update_logical_id_hash(expected)
-            self._update_logical_id_hash(output_fragment)
-
-        assert deep_sort_lists(output_fragment) == deep_sort_lists(expected)
+        self._compare_transform(manifest, expected, partition, region, True)
 
     @parameterized.expand(
         itertools.product(
@@ -371,12 +322,15 @@ class TestTranslatorEndToEnd(TestCase):
                 "api_with_auth_all_minimum_openapi",
                 "api_with_swagger_and_openapi_with_auth",
                 "api_with_openapi_definition_body_no_flag",
+                "api_request_model_with_validator_openapi_3",
                 "api_request_model_openapi_3",
                 "api_with_apikey_required_openapi_3",
                 "api_with_basic_custom_domain",
                 "api_with_basic_custom_domain_intrinsics",
                 "api_with_custom_domain_route53",
                 "api_with_custom_domain_route53_hosted_zone_name",
+                "api_with_custom_domain_route53_multiple",
+                "api_with_custom_domain_route53_multiple_intrinsic_hostedzoneid",
                 "api_with_basic_custom_domain_http",
                 "api_with_basic_custom_domain_intrinsics_http",
                 "api_with_custom_domain_route53_http",
@@ -390,10 +344,19 @@ class TestTranslatorEndToEnd(TestCase):
                 "http_api_explicit_stage",
                 "http_api_def_uri",
                 "explicit_http_api",
+                "explicit_http_api_with_name",
+                "http_api_custom_iam_auth",
                 "http_api_with_cors",
                 "http_api_description",
+                "http_api_global_iam_auth_enabled_with_existing_conflicting_authorizer",
+                "http_api_global_iam_auth_enabled",
                 "http_api_lambda_auth",
                 "http_api_lambda_auth_full",
+                "http_api_local_iam_auth_enabled_with_existing_conflicting_authorizer",
+                "http_api_local_iam_auth_enabled",
+                "http_api_multiple_authorizers",
+                "http_api_with_custom_domain_route53_multiple",
+                "mixed_api_with_custom_domain_route53_multiple",
             ],
             [
                 ("aws", "ap-southeast-1"),
@@ -407,40 +370,34 @@ class TestTranslatorEndToEnd(TestCase):
         "samtranslator.plugins.application.serverless_app_plugin.ServerlessAppPlugin._sar_service_call",
         mock_sar_service_call,
     )
-    @patch("botocore.client.ClientEndpointBridge._check_default_region", mock_get_region)
-    def test_transform_success_openapi3(self, testcase, partition_with_region):
+    @patch("samtranslator.translator.arn_generator._get_region_from_session")
+    def test_transform_success_openapi3(self, testcase, partition_with_region, mock_get_region_from_session):
         partition = partition_with_region[0]
         region = partition_with_region[1]
+        mock_get_region_from_session.return_value = region
 
-        manifest = yaml_parse(open(os.path.join(INPUT_FOLDER, testcase + ".yaml"), "r"))
+        manifest = yaml_parse(open(os.path.join(INPUT_FOLDER, testcase + ".yaml")))
         # To uncover unicode-related bugs, convert dict to JSON string and parse JSON back to dict
         manifest = json.loads(json.dumps(manifest))
         partition_folder = partition if partition != "aws" else ""
         expected_filepath = os.path.join(OUTPUT_FOLDER, partition_folder, testcase + ".json")
-        expected = json.load(open(expected_filepath, "r"))
+        expected = json.load(open(expected_filepath))
 
         with patch("boto3.session.Session.region_name", region):
             parameter_values = get_template_parameter_values()
             mock_policy_loader = MagicMock()
             mock_policy_loader.load.return_value = {
-                "AWSLambdaBasicExecutionRole": "arn:{}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole".format(
-                    partition
-                ),
-                "AmazonDynamoDBFullAccess": "arn:{}:iam::aws:policy/AmazonDynamoDBFullAccess".format(partition),
-                "AmazonDynamoDBReadOnlyAccess": "arn:{}:iam::aws:policy/AmazonDynamoDBReadOnlyAccess".format(partition),
-                "AWSLambdaRole": "arn:{}:iam::aws:policy/service-role/AWSLambdaRole".format(partition),
+                "AWSLambdaBasicExecutionRole": f"arn:{partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+                "AmazonDynamoDBFullAccess": f"arn:{partition}:iam::aws:policy/AmazonDynamoDBFullAccess",
+                "AmazonDynamoDBReadOnlyAccess": f"arn:{partition}:iam::aws:policy/AmazonDynamoDBReadOnlyAccess",
+                "AWSLambdaRole": f"arn:{partition}:iam::aws:policy/service-role/AWSLambdaRole",
             }
 
             output_fragment = transform(manifest, parameter_values, mock_policy_loader)
 
         print(json.dumps(output_fragment, indent=2))
 
-        # Only update the deployment Logical Id hash in Py3.
-        if sys.version_info.major >= 3:
-            self._update_logical_id_hash(expected)
-            self._update_logical_id_hash(output_fragment)
-
-        assert deep_sort_lists(output_fragment) == deep_sort_lists(expected)
+        self.assertEqual(deep_sort_lists(output_fragment), deep_sort_lists(expected))
 
     @parameterized.expand(
         itertools.product(
@@ -467,230 +424,82 @@ class TestTranslatorEndToEnd(TestCase):
         "samtranslator.plugins.application.serverless_app_plugin.ServerlessAppPlugin._sar_service_call",
         mock_sar_service_call,
     )
-    @patch("botocore.client.ClientEndpointBridge._check_default_region", mock_get_region)
-    def test_transform_success_resource_policy(self, testcase, partition_with_region):
+    @patch("samtranslator.translator.arn_generator._get_region_from_session")
+    def test_transform_success_resource_policy(self, testcase, partition_with_region, mock_get_region_from_session):
         partition = partition_with_region[0]
         region = partition_with_region[1]
+        mock_get_region_from_session.return_value = region
 
-        manifest = yaml_parse(open(os.path.join(INPUT_FOLDER, testcase + ".yaml"), "r"))
+        manifest = yaml_parse(open(os.path.join(INPUT_FOLDER, testcase + ".yaml")))
         # To uncover unicode-related bugs, convert dict to JSON string and parse JSON back to dict
         manifest = json.loads(json.dumps(manifest))
         partition_folder = partition if partition != "aws" else ""
         expected_filepath = os.path.join(OUTPUT_FOLDER, partition_folder, testcase + ".json")
-        expected = json.load(open(expected_filepath, "r"))
+        expected = json.load(open(expected_filepath))
 
         with patch("boto3.session.Session.region_name", region):
             parameter_values = get_template_parameter_values()
             mock_policy_loader = MagicMock()
             mock_policy_loader.load.return_value = {
-                "AWSLambdaBasicExecutionRole": "arn:{}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole".format(
-                    partition
-                ),
-                "AmazonDynamoDBFullAccess": "arn:{}:iam::aws:policy/AmazonDynamoDBFullAccess".format(partition),
-                "AmazonDynamoDBReadOnlyAccess": "arn:{}:iam::aws:policy/AmazonDynamoDBReadOnlyAccess".format(partition),
-                "AWSLambdaRole": "arn:{}:iam::aws:policy/service-role/AWSLambdaRole".format(partition),
+                "AWSLambdaBasicExecutionRole": f"arn:{partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+                "AmazonDynamoDBFullAccess": f"arn:{partition}:iam::aws:policy/AmazonDynamoDBFullAccess",
+                "AmazonDynamoDBReadOnlyAccess": f"arn:{partition}:iam::aws:policy/AmazonDynamoDBReadOnlyAccess",
+                "AWSLambdaRole": f"arn:{partition}:iam::aws:policy/service-role/AWSLambdaRole",
             }
 
             output_fragment = transform(manifest, parameter_values, mock_policy_loader)
         print(json.dumps(output_fragment, indent=2))
 
-        # Only update the deployment Logical Id hash in Py3.
-        if sys.version_info.major >= 3:
-            self._update_logical_id_hash(expected)
-            self._update_logical_id_hash(output_fragment)
-        assert deep_sort_lists(output_fragment) == deep_sort_lists(expected)
+        self.assertEqual(deep_sort_lists(output_fragment), deep_sort_lists(expected))
 
-    def _update_logical_id_hash(self, resources):
+    @parameterized.expand(
+        itertools.product(
+            [
+                (
+                    "usage_plans",
+                    ("api_with_usageplans_shared_no_side_effect_1", "api_with_usageplans_shared_no_side_effect_2"),
+                ),
+            ],
+            [
+                ("aws", "ap-southeast-1"),
+                ("aws-cn", "cn-north-1"),
+                ("aws-us-gov", "us-gov-west-1"),
+            ],
+        )
+    )
+    @patch(
+        "samtranslator.plugins.application.serverless_app_plugin.ServerlessAppPlugin._sar_service_call",
+        mock_sar_service_call,
+    )
+    @patch("samtranslator.translator.arn_generator._get_region_from_session")
+    def test_transform_success_no_side_effect(self, testcase, partition_with_region, mock_get_region_from_session):
         """
-        Brute force method for updating all APIGW Deployment LogicalIds and references to a consistent hash
+        Tests that the transform does not leak/leave data in shared caches/lists between executions
+        Performs the transform of the templates in a row without reinitialization
+        Data from template X should not leak in template X+1
+
+        Parameters
+        ----------
+        testcase : Tuple
+            Test name (unused) and Templates
+        templates : List
+            List of templates to transform
         """
-        output_resources = resources.get("Resources", {})
-        deployment_logical_id_dict = {}
-        rest_api_to_swagger_hash = {}
-        dict_of_things_to_delete = {}
+        partition = partition_with_region[0]
+        region = partition_with_region[1]
+        mock_get_region_from_session.return_value = region
 
-        # Find all RestApis in the template
-        for logical_id, resource_dict in output_resources.items():
-            if "AWS::ApiGateway::RestApi" == resource_dict.get("Type"):
-                resource_properties = resource_dict.get("Properties", {})
-                if "Body" in resource_properties:
-                    self._generate_new_deployment_hash(
-                        logical_id, resource_properties.get("Body"), rest_api_to_swagger_hash
-                    )
+        for template in testcase[1]:
+            print(template, partition, region)
+            manifest = self._read_input(template)
+            expected = self._read_expected_output(template, partition)
 
-                elif "BodyS3Location" in resource_dict.get("Properties"):
-                    self._generate_new_deployment_hash(
-                        logical_id, resource_properties.get("BodyS3Location"), rest_api_to_swagger_hash
-                    )
-
-        # Collect all APIGW Deployments LogicalIds and generate the new ones
-        for logical_id, resource_dict in output_resources.items():
-            if "AWS::ApiGateway::Deployment" == resource_dict.get("Type"):
-                resource_properties = resource_dict.get("Properties", {})
-
-                rest_id = resource_properties.get("RestApiId").get("Ref")
-
-                data_hash = rest_api_to_swagger_hash.get(rest_id)
-
-                description = resource_properties.get("Description")[: -len(data_hash)]
-
-                resource_properties["Description"] = description + data_hash
-
-                new_logical_id = logical_id[:-10] + data_hash[:10]
-
-                deployment_logical_id_dict[logical_id] = new_logical_id
-                dict_of_things_to_delete[logical_id] = (new_logical_id, resource_dict)
-
-        # Update References to APIGW Deployments
-        for logical_id, resource_dict in output_resources.items():
-            if "AWS::ApiGateway::Stage" == resource_dict.get("Type"):
-                resource_properties = resource_dict.get("Properties", {})
-
-                rest_id = resource_properties.get("RestApiId", {}).get("Ref", "")
-
-                data_hash = rest_api_to_swagger_hash.get(rest_id)
-
-                deployment_id = resource_properties.get("DeploymentId", {}).get("Ref")
-                new_logical_id = deployment_logical_id_dict.get(deployment_id, "")[:-10]
-                new_logical_id = new_logical_id + data_hash[:10]
-
-                resource_properties.get("DeploymentId", {})["Ref"] = new_logical_id
-
-        # To avoid mutating the template while iterating, delete only after find everything to update
-        for logical_id_to_remove, tuple_to_add in dict_of_things_to_delete.items():
-            output_resources[tuple_to_add[0]] = tuple_to_add[1]
-            del output_resources[logical_id_to_remove]
-
-        # Update any Output References in the template
-        for output_key, output_value in resources.get("Outputs", {}).items():
-            if output_value.get("Value").get("Ref") in deployment_logical_id_dict:
-                output_value["Value"]["Ref"] = deployment_logical_id_dict[output_value.get("Value").get("Ref")]
-
-    def _generate_new_deployment_hash(self, logical_id, dict_to_hash, rest_api_to_swagger_hash):
-        data_bytes = json.dumps(dict_to_hash, separators=(",", ":"), sort_keys=True).encode("utf8")
-        data_hash = hashlib.sha1(data_bytes).hexdigest()
-        rest_api_to_swagger_hash[logical_id] = data_hash
+            self._compare_transform(manifest, expected, partition, region)
 
 
 @pytest.mark.parametrize(
     "testcase",
-    [
-        "error_state_machine_definition_string",
-        "error_state_machine_invalid_s3_object",
-        "error_state_machine_invalid_s3_string",
-        "error_state_machine_with_api_auth_none",
-        "error_state_machine_with_no_api_authorizers",
-        "error_state_machine_with_undefined_api_authorizer",
-        "error_state_machine_with_invalid_default_authorizer",
-        "error_state_machine_with_schedule_invalid_dlq_type",
-        "error_state_machine_with_schedule_both_dlq_property_provided",
-        "error_state_machine_with_schedule_missing_dlq_property",
-        "error_state_machine_with_cwe_invalid_dlq_type",
-        "error_state_machine_with_cwe_both_dlq_property_provided",
-        "error_state_machine_with_cwe_missing_dlq_property",
-        "error_cognito_userpool_duplicate_trigger",
-        "error_cognito_userpool_not_string",
-        "error_api_duplicate_methods_same_path",
-        "error_api_gateway_responses_nonnumeric_status_code",
-        "error_api_gateway_responses_unknown_responseparameter",
-        "error_api_gateway_responses_unknown_responseparameter_property",
-        "error_api_invalid_auth",
-        "error_api_invalid_path",
-        "error_api_invalid_definitionuri",
-        "error_api_invalid_definitionbody",
-        "error_api_invalid_stagename",
-        "error_api_with_invalid_open_api_version",
-        "error_api_invalid_restapiid",
-        "error_api_invalid_request_model",
-        "error_application_properties",
-        "error_application_does_not_exist",
-        "error_application_no_access",
-        "error_application_preparing_timeout",
-        "error_cors_on_external_swagger",
-        "error_invalid_cors_dict",
-        "error_invalid_findinmap",
-        "error_invalid_getatt",
-        "error_cors_credentials_true_with_wildcard_origin",
-        "error_cors_credentials_true_without_explicit_origin",
-        "error_function_invalid_codeuri",
-        "error_function_invalid_api_event",
-        "error_function_invalid_autopublishalias",
-        "error_function_invalid_event_type",
-        "error_function_invalid_layer",
-        "error_function_no_codeuri",
-        "error_function_no_handler",
-        "error_function_no_runtime",
-        "error_function_with_deployment_preference_missing_alias",
-        "error_function_with_invalid_deployment_preference_hook_property",
-        "error_function_invalid_request_parameters",
-        "error_function_with_schedule_invalid_dlq_type",
-        "error_function_with_schedule_both_dlq_property_provided",
-        "error_function_with_schedule_missing_dlq_property",
-        "error_function_with_cwe_invalid_dlq_type",
-        "error_function_with_cwe_both_dlq_property_provided",
-        "error_function_with_cwe_missing_dlq_property",
-        "error_invalid_logical_id",
-        "error_layer_invalid_properties",
-        "error_missing_broker",
-        "error_missing_queue",
-        "error_missing_startingposition",
-        "error_missing_stream",
-        "error_multiple_resource_errors",
-        "error_null_application_id",
-        "error_s3_not_in_template",
-        "error_table_invalid_attributetype",
-        "error_table_primary_key_missing_name",
-        "error_table_primary_key_missing_type",
-        "error_invalid_resource_parameters",
-        "error_reserved_sam_tag",
-        "error_existing_event_logical_id",
-        "error_existing_permission_logical_id",
-        "error_existing_role_logical_id",
-        "error_invalid_template",
-        "error_resource_not_dict",
-        "error_resource_properties_not_dict",
-        "error_globals_is_not_dict",
-        "error_globals_unsupported_type",
-        "error_globals_unsupported_property",
-        "error_globals_api_with_stage_name",
-        "error_function_policy_template_with_missing_parameter",
-        "error_function_policy_template_invalid_value",
-        "error_function_with_unknown_policy_template",
-        "error_function_with_invalid_policy_statement",
-        "error_function_with_invalid_condition_name",
-        "error_invalid_document_empty_semantic_version",
-        "error_api_with_invalid_open_api_version_type",
-        "error_api_with_invalid_auth_scopes_openapi",
-        "error_api_with_custom_domains_invalid",
-        "error_api_with_custom_domains_route53_invalid",
-        "error_api_event_import_vaule_reference",
-        "error_function_with_method_auth_and_no_api_auth",
-        "error_function_with_no_alias_provisioned_concurrency",
-        "error_http_api_def_body_uri",
-        "error_http_api_event_invalid_api",
-        "error_http_api_invalid_auth",
-        "error_http_api_invalid_openapi",
-        "error_http_api_tags",
-        "error_http_api_tags_def_uri",
-        "error_implicit_http_api_method",
-        "error_implicit_http_api_path",
-        "error_http_api_event_multiple_same_path",
-        "error_function_with_event_dest_invalid",
-        "error_function_with_event_dest_type",
-        "error_function_with_api_key_false",
-        "error_api_with_usage_plan_invalid_parameter",
-        "error_http_api_with_cors_def_uri",
-        "error_http_api_invalid_lambda_auth",
-        "error_api_mtls_configuration_invalid_field",
-        "error_api_mtls_configuration_invalid_type",
-        "error_httpapi_mtls_configuration_invalid_field",
-        "error_httpapi_mtls_configuration_invalid_type",
-        "error_resource_policy_not_dict",
-        "error_implicit_http_api_auth_any_method",
-        "error_invalid_method_definition",
-        "error_mappings_is_null",
-        "error_swagger_security_not_dict",
-    ],
+    ERROR_FILES_NAMES_FOR_TESTING,
 )
 @patch("boto3.session.Session.region_name", "ap-southeast-1")
 @patch(
@@ -699,8 +508,8 @@ class TestTranslatorEndToEnd(TestCase):
 )
 @patch("botocore.client.ClientEndpointBridge._check_default_region", mock_get_region)
 def test_transform_invalid_document(testcase):
-    manifest = yaml_parse(open(os.path.join(INPUT_FOLDER, testcase + ".yaml"), "r"))
-    expected = json.load(open(os.path.join(OUTPUT_FOLDER, testcase + ".json"), "r"))
+    manifest = yaml_parse(open(os.path.join(INPUT_FOLDER, testcase + ".yaml")))
+    expected = json.load(open(os.path.join(OUTPUT_FOLDER, testcase + ".json")))
 
     mock_policy_loader = MagicMock()
     parameter_values = get_template_parameter_values()
@@ -709,38 +518,9 @@ def test_transform_invalid_document(testcase):
         transform(manifest, parameter_values, mock_policy_loader)
 
     error_message = get_exception_error_message(e)
+    error_message = re.sub(r"u'([A-Za-z0-9]*)'", r"'\1'", error_message)
 
     assert error_message == expected.get("errorMessage")
-
-
-@patch("boto3.session.Session.region_name", "ap-southeast-1")
-@patch("botocore.client.ClientEndpointBridge._check_default_region", mock_get_region)
-def test_transform_unhandled_failure_empty_managed_policy_map():
-    document = {
-        "Transform": "AWS::Serverless-2016-10-31",
-        "Resources": {
-            "Resource": {
-                "Type": "AWS::Serverless::Function",
-                "Properties": {
-                    "CodeUri": "s3://bucket/key",
-                    "Handler": "index.handler",
-                    "Runtime": "nodejs12.x",
-                    "Policies": "AmazonS3FullAccess",
-                },
-            }
-        },
-    }
-
-    parameter_values = get_template_parameter_values()
-    mock_policy_loader = MagicMock()
-    mock_policy_loader.load.return_value = {}
-
-    with pytest.raises(Exception) as e:
-        transform(document, parameter_values, mock_policy_loader)
-
-    error_message = str(e.value)
-
-    assert error_message == "Managed policy map is empty, but should not be."
 
 
 def assert_metric_call(mock, transform, transform_failure=0, invalid_document=0):
@@ -768,7 +548,6 @@ def assert_metric_call(mock, transform, transform_failure=0, invalid_document=0)
 @patch("boto3.session.Session.region_name", "ap-southeast-1")
 @patch("botocore.client.ClientEndpointBridge._check_default_region", mock_get_region)
 def test_swagger_body_sha_gets_recomputed():
-
     document = {
         "Transform": "AWS::Serverless-2016-10-31",
         "Resources": {
@@ -810,7 +589,6 @@ def test_swagger_body_sha_gets_recomputed():
 @patch("boto3.session.Session.region_name", "ap-southeast-1")
 @patch("botocore.client.ClientEndpointBridge._check_default_region", mock_get_region)
 def test_swagger_definitionuri_sha_gets_recomputed():
-
     document = {
         "Transform": "AWS::Serverless-2016-10-31",
         "Resources": {
@@ -913,7 +691,316 @@ class TestFunctionVersionWithParameterReferences(TestCase):
         return output_fragment
 
 
+class TestApiAlwaysDeploy(TestCase):
+    """
+    AlwaysDeploy is used to force API Gateway to redeploy at every deployment.
+    See https://github.com/aws/serverless-application-model/issues/660
+
+    Since it relies on the system time to generate the template, need to patch
+    time.time() for deterministic tests.
+    """
+
+    @staticmethod
+    def get_deployment_ids(template):
+        cfn_template = Translator({}, Parser()).translate(template, {})
+        deployment_ids = set()
+        for k, v in cfn_template["Resources"].items():
+            if v["Type"] == "AWS::ApiGateway::Deployment":
+                deployment_ids.add(k)
+        return deployment_ids
+
+    @patch("boto3.session.Session.region_name", "ap-southeast-1")
+    @patch("botocore.client.ClientEndpointBridge._check_default_region", mock_get_region)
+    def test_always_deploy(self):
+        with patch("time.time", lambda: 13.37):
+            obj = _parse_yaml("tests/translator/input/translate_always_deploy.yaml")
+            deployment_ids = TestApiAlwaysDeploy.get_deployment_ids(obj)
+            self.assertEqual(deployment_ids, {"MyApiDeploymentbd307a3ec3"})
+
+        with patch("time.time", lambda: 42.123):
+            obj = _parse_yaml("tests/translator/input/translate_always_deploy.yaml")
+            deployment_ids = TestApiAlwaysDeploy.get_deployment_ids(obj)
+            self.assertEqual(deployment_ids, {"MyApiDeployment92cfceb39d"})
+
+        with patch("time.time", lambda: 42.1337):
+            obj = _parse_yaml("tests/translator/input/translate_always_deploy.yaml")
+            deployment_ids = TestApiAlwaysDeploy.get_deployment_ids(obj)
+            self.assertEqual(deployment_ids, {"MyApiDeployment92cfceb39d"})
+
+    @patch("boto3.session.Session.region_name", "ap-southeast-1")
+    @patch("botocore.client.ClientEndpointBridge._check_default_region", mock_get_region)
+    def test_without_alwaysdeploy_never_changes(self):
+        sam_template = {
+            "Resources": {
+                "MyApi": {
+                    "Type": "AWS::Serverless::Api",
+                    "Properties": {
+                        "StageName": "prod",
+                    },
+                }
+            },
+        }
+
+        deployment_ids = set()
+        deployment_ids.update(TestApiAlwaysDeploy.get_deployment_ids(sam_template))
+        time.sleep(2)
+        deployment_ids.update(TestApiAlwaysDeploy.get_deployment_ids(sam_template))
+        time.sleep(2)
+        deployment_ids.update(TestApiAlwaysDeploy.get_deployment_ids(sam_template))
+
+        self.assertEqual(len(deployment_ids), 1)
+
+    @patch("boto3.session.Session.region_name", "ap-southeast-1")
+    @patch("botocore.client.ClientEndpointBridge._check_default_region", mock_get_region)
+    def test_with_alwaysdeploy_always_changes(self):
+        sam_template = {
+            "Resources": {
+                "MyApi": {
+                    "Type": "AWS::Serverless::Api",
+                    "Properties": {
+                        "StageName": "prod",
+                        "AlwaysDeploy": True,
+                    },
+                }
+            },
+        }
+
+        deployment_ids = set()
+        deployment_ids.update(TestApiAlwaysDeploy.get_deployment_ids(sam_template))
+        time.sleep(2)
+        deployment_ids.update(TestApiAlwaysDeploy.get_deployment_ids(sam_template))
+        time.sleep(2)
+        deployment_ids.update(TestApiAlwaysDeploy.get_deployment_ids(sam_template))
+
+        self.assertEqual(len(deployment_ids), 3)
+
+
 class TestTemplateValidation(TestCase):
+    _MANAGED_POLICIES_TEMPLATE = {
+        "Resources": {
+            "MyFunction": {
+                "Type": "AWS::Serverless::Function",
+                "Properties": {
+                    "Runtime": "python3.11",
+                    "Handler": "foo",
+                    "InlineCode": "bar",
+                    "Policies": [
+                        "foo",
+                        "bar",
+                    ],
+                },
+            },
+            "MyStateMachine": {
+                "Type": "AWS::Serverless::StateMachine",
+                "Properties": {
+                    "DefinitionUri": "s3://foo/bar",
+                    "Policies": [
+                        "foo",
+                        "bar",
+                    ],
+                },
+            },
+        }
+    }
+
+    @parameterized.expand(
+        [
+            # All combinations, should use first that matches from left
+            ({"foo": "a1"}, {"foo": "a2"}, {"foo": "a3"}, "a1"),
+            (None, None, {"foo": "a3"}, "a3"),
+            (None, {"foo": "a2"}, None, "a2"),
+            ({"foo": "a1"}, {"foo": "a2"}, None, "a1"),
+            (None, None, {"foo": "a3"}, "a3"),
+            (None, {"foo": "a2"}, None, "a2"),
+            ({"foo": "a1"}, None, None, "a1"),
+            (None, None, None, "foo"),
+        ]
+    )
+    @patch("boto3.session.Session.region_name", "ap-southeast-1")
+    @patch("botocore.client.ClientEndpointBridge._check_default_region", mock_get_region)
+    def test_managed_policies_translator_translate(
+        self,
+        managed_policy_map,
+        bundled_managed_policy_map,
+        get_managed_policy_map_value,
+        expected_arn,
+    ):
+        """
+        Ensure expectd ARN is derived from managed policy name when transforming
+        with Translator.translate() (used in actual transform).
+
+        This tests the fallback logic, but in practice managed_policy_map and
+        get_managed_policy_map() are expected to be the same. They must both be
+        currently supported managed policies for the Policies property to work.
+        """
+
+        def get_managed_policy_map():
+            return get_managed_policy_map_value
+
+        with patch(
+            "samtranslator.internal.managed_policies._BUNDLED_MANAGED_POLICIES",
+            {"aws": bundled_managed_policy_map},
+        ):
+            parameters = {}
+            cfn_template = Translator(managed_policy_map, Parser()).translate(
+                self._MANAGED_POLICIES_TEMPLATE,
+                parameters,
+                get_managed_policy_map=get_managed_policy_map,
+            )
+
+        function_arn = cfn_template["Resources"]["MyFunctionRole"]["Properties"]["ManagedPolicyArns"][1]
+        sfn_arn = cfn_template["Resources"]["MyStateMachineRole"]["Properties"]["ManagedPolicyArns"][0]
+
+        self.assertEqual(function_arn, expected_arn)
+        self.assertEqual(sfn_arn, expected_arn)
+
+    # test to make sure with arn it doesnt load, with non-arn it does
+    @parameterized.expand(
+        [
+            ([""], 1),
+            (["SomeNonArnThing"], 1),
+            (["SomeNonArnThing", "AnotherNonArnThing"], 1),
+            (["aws:looks:like:an:ARN:but-not-really"], 1),
+            (["arn:looks:like:an:ARN:foo", "Mixing_things_v2"], 1),
+            (["arn:looks:like:an:ARN:foo"], 0),
+            ([{"Ref": "Foo"}], 0),
+            ([{"SQSPollerPolicy": {"QueueName": "Bar"}}], 0),
+            (["arn:looks:like:an:ARN", "arn:aws:ec2:us-east-1:123456789012:vpc/vpc-0e9801d129EXAMPLE"], 0),
+        ]
+    )
+    @patch("boto3.session.Session.region_name", "ap-southeast-1")
+    @patch("botocore.client.ClientEndpointBridge._check_default_region", mock_get_region)
+    def test_managed_policies_arn_not_loaded(self, policies, load_policy_count):
+        class ManagedPolicyLoader:
+            def __init__(self):
+                self.call_count = 0
+
+            def load(self):
+                self.call_count += 1
+                return {}
+
+        managed_policy_loader = ManagedPolicyLoader()
+
+        with patch("samtranslator.internal.managed_policies._BUNDLED_MANAGED_POLICIES", {}):
+            transform(
+                {
+                    "Resources": {
+                        "MyFunction": {
+                            "Type": "AWS::Serverless::Function",
+                            "Properties": {
+                                "Handler": "foo",
+                                "InlineCode": "bar",
+                                "Runtime": "nodejs18.x",
+                                "Policies": policies,
+                            },
+                        },
+                        "MyStateMachine": {
+                            "Type": "AWS::Serverless::StateMachine",
+                            "Properties": {
+                                "DefinitionUri": "s3://egg/baz",
+                                "Policies": policies,
+                            },
+                        },
+                    }
+                },
+                {},
+                managed_policy_loader,
+            )
+
+        self.assertEqual(load_policy_count, managed_policy_loader.call_count)
+
+    @parameterized.expand(
+        [
+            # All combinations, bundled map takes precedence
+            ({"foo": "a1"}, {"foo": "a2"}, "a2"),
+            ({"foo": "a1"}, None, "a1"),
+            (None, {"foo": "a2"}, "a2"),
+            (None, None, "foo"),
+        ]
+    )
+    @patch("boto3.session.Session.region_name", "ap-southeast-1")
+    @patch("botocore.client.ClientEndpointBridge._check_default_region", mock_get_region)
+    def test_managed_policies_transform(
+        self,
+        managed_policy_map,
+        bundled_managed_policy_map,
+        expected_arn,
+    ):
+        """
+        Ensure expectd ARN is derived from managed policy name when transforming
+        with transform(). It calls Translator.translate() under the hood.
+        """
+
+        class ManagedPolicyLoader:
+            def load(self):
+                return managed_policy_map
+
+        with patch(
+            "samtranslator.internal.managed_policies._BUNDLED_MANAGED_POLICIES",
+            {"aws": bundled_managed_policy_map},
+        ):
+            parameters = {}
+            cfn_template = transform(
+                self._MANAGED_POLICIES_TEMPLATE,
+                parameters,
+                ManagedPolicyLoader(),
+            )
+
+        function_arn = cfn_template["Resources"]["MyFunctionRole"]["Properties"]["ManagedPolicyArns"][1]
+        sfn_arn = cfn_template["Resources"]["MyStateMachineRole"]["Properties"]["ManagedPolicyArns"][0]
+
+        self.assertEqual(function_arn, expected_arn)
+        self.assertEqual(sfn_arn, expected_arn)
+
+    @patch("boto3.session.Session.region_name", "ap-southeast-1")
+    @patch("botocore.client.ClientEndpointBridge._check_default_region", mock_get_region)
+    def test_managed_policies_transform_policies_loaded_once(self):
+        """
+        Ensure transform() calls the policy loader load() (i.e. IAM call) only once.
+        """
+
+        class ManagedPolicyLoader:
+            def __init__(self):
+                self.call_count = 0
+
+            def load(self):
+                self.call_count += 1
+                return {}
+
+        managed_policy_loader = ManagedPolicyLoader()
+
+        with patch("samtranslator.internal.managed_policies._BUNDLED_MANAGED_POLICIES", {}):
+            transform(
+                {
+                    "Resources": {
+                        "MyStateMachine1": {
+                            "Type": "AWS::Serverless::StateMachine",
+                            "Properties": {
+                                "DefinitionUri": "s3://foo/bar",
+                                "Policies": [
+                                    "foo",
+                                    "bar",
+                                ],
+                            },
+                        },
+                        "MyStateMachine2": {
+                            "Type": "AWS::Serverless::StateMachine",
+                            "Properties": {
+                                "DefinitionUri": "s3://egg/baz",
+                                "Policies": [
+                                    "egg",
+                                    "baz",
+                                ],
+                            },
+                        },
+                    }
+                },
+                {},
+                managed_policy_loader,
+            )
+
+        self.assertEqual(1, managed_policy_loader.call_count)
+
     @patch("boto3.session.Session.region_name", "ap-southeast-1")
     @patch("botocore.client.ClientEndpointBridge._check_default_region", mock_get_region)
     def test_throws_when_resource_not_found(self):
@@ -954,6 +1041,41 @@ class TestTemplateValidation(TestCase):
             translator = Translator({}, sam_parser)
             translator.translate(template, {})
 
+    @patch("boto3.session.Session.region_name", "ap-southeast-1")
+    @patch("botocore.client.ClientEndpointBridge._check_default_region", mock_get_region)
+    def test_validate_translated_no_metadata(self):
+        with open(os.path.join(INPUT_FOLDER, "translate_convert_metadata.yaml")) as f:
+            template = yaml_parse(f.read())
+        with open(os.path.join(OUTPUT_FOLDER, "translate_convert_no_metadata.json")) as f:
+            expected = json.loads(f.read())
+
+        sam_parser = Parser()
+        translator = Translator(None, sam_parser)
+        actual = translator.translate(template, {})
+        self.assertEqual(expected, actual)
+
+    @patch("boto3.session.Session.region_name", "ap-southeast-1")
+    @patch("botocore.client.ClientEndpointBridge._check_default_region", mock_get_region)
+    def test_validate_translated_metadata(self):
+        self.maxDiff = None
+        with open(os.path.join(INPUT_FOLDER, "translate_convert_metadata.yaml")) as f:
+            template = yaml_parse(f.read())
+        with open(os.path.join(OUTPUT_FOLDER, "translate_convert_metadata.json")) as f:
+            expected = json.loads(f.read())
+
+        sam_parser = Parser()
+        translator = Translator(None, sam_parser)
+        actual = translator.translate(template, {}, passthrough_metadata=True)
+        self.assertEqual(expected, actual)
+
+
+class _SomethingPlugin(BasePlugin):
+    pass
+
+
+class _CustomPlugin(BasePlugin):
+    pass
+
 
 class TestPluginsUsage(TestCase):
     # Tests if plugins are properly injected into the translator
@@ -961,9 +1083,8 @@ class TestPluginsUsage(TestCase):
     @patch("samtranslator.translator.translator.make_policy_template_for_function_plugin")
     @patch("botocore.client.ClientEndpointBridge._check_default_region", mock_get_region)
     def test_prepare_plugins_must_add_required_plugins(self, make_policy_template_for_function_plugin_mock):
-
         # This is currently the only required plugin
-        plugin_instance = BasePlugin("something")
+        plugin_instance = _SomethingPlugin()
         make_policy_template_for_function_plugin_mock.return_value = plugin_instance
 
         sam_plugins = prepare_plugins([])
@@ -972,17 +1093,15 @@ class TestPluginsUsage(TestCase):
     @patch("samtranslator.translator.translator.make_policy_template_for_function_plugin")
     @patch("botocore.client.ClientEndpointBridge._check_default_region", mock_get_region)
     def test_prepare_plugins_must_merge_input_plugins(self, make_policy_template_for_function_plugin_mock):
-
-        required_plugin = BasePlugin("something")
+        required_plugin = _SomethingPlugin()
         make_policy_template_for_function_plugin_mock.return_value = required_plugin
 
-        custom_plugin = BasePlugin("someplugin")
+        custom_plugin = _CustomPlugin()
         sam_plugins = prepare_plugins([custom_plugin])
         self.assertEqual(7, len(sam_plugins))
 
     @patch("botocore.client.ClientEndpointBridge._check_default_region", mock_get_region)
     def test_prepare_plugins_must_handle_empty_input(self):
-
         sam_plugins = prepare_plugins(None)
         self.assertEqual(6, len(sam_plugins))
 
@@ -991,7 +1110,6 @@ class TestPluginsUsage(TestCase):
     def test_make_policy_template_for_function_plugin_must_work(
         self, policy_templates_for_function_plugin_mock, policy_templates_processor_mock
     ):
-
         default_templates = {"some": "value"}
         policy_templates_processor_mock.get_default_policy_templates_json.return_value = default_templates
 
@@ -1060,7 +1178,25 @@ def get_resource_by_type(template, type):
         value = resources[key]
         if "Type" in value and value.get("Type") == type:
             return key, value
+    return None
 
 
 def get_exception_error_message(e):
-    return reduce(lambda message, error: message + " " + error.message, e.value.causes, e.value.message)
+    return reduce(
+        lambda message, error: message + " " + error.message,
+        sorted(e.value.causes, key=_exception_sort_key),
+        e.value.message,
+    )
+
+
+def _exception_sort_key(cause):
+    """
+    Returns the key to be used for sorting among other exceptions
+    """
+    if hasattr(cause, "_logical_id"):
+        return cause._logical_id
+    if hasattr(cause, "_event_id"):
+        return cause._event_id
+    if hasattr(cause, "message"):
+        return cause.message
+    return str(cause)

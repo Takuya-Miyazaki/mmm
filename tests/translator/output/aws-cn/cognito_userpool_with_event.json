@@ -1,67 +1,47 @@
 {
   "Resources": {
-    "UserPool": {
-      "Type": "AWS::Cognito::UserPool",
-      "Properties": {
-        "LambdaConfig": {
-          "PreSignUp": {
-            "Fn::GetAtt": [
-              "ImplicitApiFunction", "Arn"
-            ]
-          },
-          "PreAuthentication": "Test",
-          "Test1": {
-            "Fn::GetAtt": [
-              "ImplicitApiFunction",
-              "Arn"
-            ]
-          },
-          "Test2": {
-            "Fn::GetAtt": [
-              "ImplicitApiFunction",
-              "Arn"
-            ]
-          }
-        }
-      }
-    },
     "ImplicitApiFunction": {
-      "Type": "AWS::Lambda::Function",
       "Properties": {
-        "Handler": "index.gethtml", 
         "Code": {
-          "S3Bucket": "sam-demo-bucket", 
+          "S3Bucket": "sam-demo-bucket",
           "S3Key": "member_portal.zip"
-        }, 
+        },
+        "Handler": "index.gethtml",
         "Role": {
           "Fn::GetAtt": [
-            "ImplicitApiFunctionRole", 
+            "ImplicitApiFunctionRole",
             "Arn"
           ]
-        }, 
+        },
         "Runtime": "nodejs12.x",
         "Tags": [
           {
-            "Value": "SAM", 
-            "Key": "lambda:createdBy"
+            "Key": "lambda:createdBy",
+            "Value": "SAM"
           }
         ]
-      }
+      },
+      "Type": "AWS::Lambda::Function"
+    },
+    "ImplicitApiFunctionCognitoPermission": {
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "ImplicitApiFunction"
+        },
+        "Principal": "cognito-idp.amazonaws.com",
+        "SourceArn": {
+          "Fn::GetAtt": [
+            "UserPool",
+            "Arn"
+          ]
+        }
+      },
+      "Type": "AWS::Lambda::Permission"
     },
     "ImplicitApiFunctionRole": {
-      "Type": "AWS::IAM::Role",
       "Properties": {
-        "ManagedPolicyArns": [
-          "arn:aws-cn:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-        ],
-        "Tags": [
-          {
-            "Value": "SAM",
-            "Key": "lambda:createdBy"
-          }
-        ],
         "AssumeRolePolicyDocument": {
-          "Version": "2012-10-17",
           "Statement": [
             {
               "Action": [
@@ -74,25 +54,66 @@
                 ]
               }
             }
-          ]
-        }
-      }
-    },    
-    "ImplicitApiFunctionCognitoPermission": {
-      "Type": "AWS::Lambda::Permission",
+          ],
+          "Version": "2012-10-17"
+        },
+        "ManagedPolicyArns": [
+          "arn:aws-cn:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        ],
+        "Tags": [
+          {
+            "Key": "lambda:createdBy",
+            "Value": "SAM"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Role"
+    },
+    "UserPool": {
       "Properties": {
-        "Action": "lambda:InvokeFunction",
-        "FunctionName": {
-          "Ref": "ImplicitApiFunction"
+        "LambdaConfig": {
+          "PostConfirmation": {
+            "Fn::GetAtt": [
+              "ImplicitApiFunction",
+              "Arn"
+            ]
+          },
+          "PreSignUp": {
+            "Fn::GetAtt": [
+              "ImplicitApiFunction",
+              "Arn"
+            ]
+          },
+          "VerifyAuthChallengeResponse": {
+            "Fn::GetAtt": [
+              "ImplicitApiFunction",
+              "Arn"
+            ]
+          }
         },
-        "SourceArn": {
-          "Fn::GetAtt": [
-            "UserPool",
-            "Arn"
+        "Policies": {
+          "PasswordPolicy": {
+            "MinimumLength": 8
+          }
+        },
+        "Schema": [
+          {
+            "AttributeDataType": "String",
+            "Name": "email",
+            "Required": false
+          }
+        ],
+        "UserAttributeUpdateSettings": {
+          "AttributesRequireVerificationBeforeUpdate": [
+            "email"
           ]
         },
-        "Principal": "cognito-idp.amazonaws.com"
-      }
+        "UserPoolName": "UserPoolName",
+        "UsernameAttributes": [
+          "email"
+        ]
+      },
+      "Type": "AWS::Cognito::UserPool"
     }
   }
 }

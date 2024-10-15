@@ -1,13 +1,13 @@
-import six
+from typing import Any, Dict, Optional, Type
 
-from samtranslator.model.naming import GeneratedLogicalId
 from samtranslator.plugins.api.implicit_api_plugin import ImplicitApiPlugin
+from samtranslator.public.sdk.resource import SamResource, SamResourceType
 from samtranslator.public.swagger import SwaggerEditor
-from samtranslator.public.exceptions import InvalidEventException
-from samtranslator.public.sdk.resource import SamResourceType, SamResource
+from samtranslator.sdk.template import SamTemplate
+from samtranslator.validator.value_validator import sam_expect
 
 
-class ImplicitRestApiPlugin(ImplicitApiPlugin):
+class ImplicitRestApiPlugin(ImplicitApiPlugin[Type[SwaggerEditor]]):
     """
     This plugin provides Implicit API shorthand syntax in the SAM Spec.
     https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#api
@@ -26,27 +26,24 @@ class ImplicitRestApiPlugin(ImplicitApiPlugin):
 
     * API Event Source (In Core Translator): ONLY adds the Lambda Integration ARN to appropriate method/path
                                              in Swagger. Does **not** configure the API by any means.
-
     """
 
-    def __init__(self):
-        """
-        Initialize the plugin
-        """
-        super(ImplicitRestApiPlugin, self).__init__(ImplicitRestApiPlugin.__name__)
+    API_ID_EVENT_PROPERTY = "RestApiId"
+    IMPLICIT_API_LOGICAL_ID = "ServerlessRestApi"
+    IMPLICIT_API_CONDITION = "ServerlessRestApiCondition"
+    API_EVENT_TYPE = "Api"
+    SERVERLESS_API_RESOURCE_TYPE = SamResourceType.Api.value
+    EDITOR_CLASS = SwaggerEditor
 
-    def _setup_api_properties(self):
-        """
-        Sets up properties that are distinct to this plugin
-        """
-        self.implicit_api_logical_id = GeneratedLogicalId.implicit_api()
-        self.implicit_api_condition = "ServerlessRestApiCondition"
-        self.api_event_type = "Api"
-        self.api_type = SamResourceType.Api.value
-        self.api_id_property = "RestApiId"
-        self.editor = SwaggerEditor
-
-    def _process_api_events(self, function, api_events, template, condition=None):
+    def _process_api_events(  # noqa: PLR0913
+        self,
+        function: SamResource,
+        api_events: Dict[str, Dict[str, Any]],
+        template: SamTemplate,
+        condition: Optional[str] = None,
+        deletion_policy: Optional[str] = None,
+        update_replace_policy: Optional[str] = None,
+    ) -> None:
         """
         Actually process given API events. Iteratively adds the APIs to Swagger JSON in the respective Serverless::Api
         resource from the template
@@ -57,69 +54,40 @@ class ImplicitRestApiPlugin(ImplicitApiPlugin):
         :param str condition: optional; this is the condition that is on the function with the API event
         """
 
-        for logicalId, event in api_events.items():
-
+        for event_id, event in api_events.items():
             event_properties = event.get("Properties", {})
             if not event_properties:
                 continue
 
-            self._add_implicit_api_id_if_necessary(event_properties)
+            sam_expect(event_properties, event_id, "", is_sam_event=True).to_be_a_map("Properties should be a map.")
 
-            api_id = self._get_api_id(event_properties)
-            try:
-                path = event_properties["Path"]
-                method = event_properties["Method"]
-            except KeyError as e:
-                raise InvalidEventException(logicalId, "Event is missing key {}.".format(e))
+            self._add_tags_to_implicit_api_if_necessary(event_properties, function, template)
 
-            if not isinstance(path, six.string_types):
-                raise InvalidEventException(logicalId, "Api Event must have a String specified for 'Path'.")
-            if not isinstance(method, six.string_types):
-                raise InvalidEventException(logicalId, "Api Event must have a String specified for 'Method'.")
+            self._add_implicit_api_id_if_necessary(event_properties)  # type: ignore[no-untyped-call]
 
-            # !Ref is resolved by this time. If it is still a dict, we can't parse/use this Api.
-            if isinstance(api_id, dict):
-                raise InvalidEventException(logicalId, "Api Event must reference an Api in the same template.")
+            api_id, path, method = self._validate_api_event(event_id, event_properties)
+            self._update_resource_attributes_from_api_event(
+                api_id, path, method, condition, deletion_policy, update_replace_policy
+            )
 
-            api_dict = self.api_conditions.setdefault(api_id, {})
-            method_conditions = api_dict.setdefault(path, {})
-            method_conditions[method] = condition
+            self._add_api_to_swagger(event_id, event_properties, template)  # type: ignore[no-untyped-call]
 
-            self._add_api_to_swagger(logicalId, event_properties, template)
-
-            api_events[logicalId] = event
+            api_events[event_id] = event
 
         # We could have made changes to the Events structure. Write it back to function
         function.properties["Events"].update(api_events)
 
-    def _add_implicit_api_id_if_necessary(self, event_properties):
-        """
-        Events for implicit APIs will *not* have the RestApiId property. Absence of this property means this event
-        is associated with the Serverless::Api ImplicitAPI resource. This method solifies this assumption by adding
-        RestApiId property to events that don't have them.
-
-        :param dict event_properties: Dictionary of event properties
-        """
-        if "RestApiId" not in event_properties:
-            event_properties["RestApiId"] = {"Ref": self.implicit_api_logical_id}
-
-    def _generate_implicit_api_resource(self):
+    def _generate_implicit_api_resource(self) -> Dict[str, Any]:
         """
         Uses the implicit API in this file to generate an Implicit API resource
         """
         return ImplicitApiResource().to_dict()
 
-    def _get_api_definition_from_editor(self, editor):
+    def _get_api_definition_from_editor(self, editor: SwaggerEditor) -> Dict[str, Any]:
         """
         Helper function to return the OAS definition from the editor
         """
         return editor.swagger
-
-    def _get_api_resource_type_name(self):
-        """
-        Returns the type of API resource
-        """
-        return "AWS::Serverless::Api"
 
 
 class ImplicitApiResource(SamResource):
@@ -128,7 +96,7 @@ class ImplicitApiResource(SamResource):
     the empty swagger along with default values for other properties.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         swagger = SwaggerEditor.gen_skeleton()
 
         resource = {
@@ -145,4 +113,4 @@ class ImplicitApiResource(SamResource):
             },
         }
 
-        super(ImplicitApiResource, self).__init__(resource)
+        super().__init__(resource)

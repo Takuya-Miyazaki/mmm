@@ -1,8 +1,9 @@
-from samtranslator.plugins import BasePlugin
-from samtranslator.swagger.swagger import SwaggerEditor
+from samtranslator.metrics.method_decorator import cw_timer
 from samtranslator.open_api.open_api import OpenApiEditor
+from samtranslator.plugins import BasePlugin
 from samtranslator.public.sdk.resource import SamResourceType
 from samtranslator.public.sdk.template import SamTemplate
+from samtranslator.swagger.swagger import SwaggerEditor
 
 
 class DefaultDefinitionBodyPlugin(BasePlugin):
@@ -13,14 +14,8 @@ class DefaultDefinitionBodyPlugin(BasePlugin):
     to a minimum Swagger definition and sets `__MANAGE_SWAGGER: true`.
     """
 
-    def __init__(self):
-        """
-        Initialize the plugin.
-        """
-
-        super(DefaultDefinitionBodyPlugin, self).__init__(DefaultDefinitionBodyPlugin.__name__)
-
-    def on_before_transform_template(self, template_dict):
+    @cw_timer(prefix="Plugin-DefaultDefinitionBody")
+    def on_before_transform_template(self, template_dict):  # type: ignore[no-untyped-def]
         """
         Hook method that gets called before the SAM template is processed.
         The template has passed the validation and is guaranteed to contain a non-empty "Resources" section.

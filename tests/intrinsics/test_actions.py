@@ -1,33 +1,12 @@
 from unittest import TestCase
-from mock import patch, Mock
-from samtranslator.intrinsics.actions import Action, RefAction, SubAction, GetAttAction, FindInMapAction
+from unittest.mock import Mock, patch
+
+from samtranslator.intrinsics.actions import Action, FindInMapAction, GetAttAction, RefAction, SubAction
 from samtranslator.intrinsics.resource_refs import SupportedResourceReferences
-from samtranslator.model.exceptions import InvalidTemplateException, InvalidDocumentException
+from samtranslator.model.exceptions import InvalidDocumentException
 
 
 class TestAction(TestCase):
-    def test_subclass_must_override_type(self):
-
-        # Subclass must override the intrinsic_name
-        class MyAction(Action):
-            pass
-
-        with self.assertRaises(TypeError):
-            MyAction()
-
-    def test_subclass_must_implement_resolve_method(self):
-        class MyAction(Action):
-            intrinsic_name = "foo"
-
-        with self.assertRaises(NotImplementedError):
-            MyAction().resolve_parameter_refs({}, {})
-
-        with self.assertRaises(NotImplementedError):
-            MyAction().resolve_resource_refs({}, {})
-
-        with self.assertRaises(NotImplementedError):
-            MyAction().resolve_resource_id_refs({}, {})
-
     def test_can_handle_input(self):
         class MyAction(Action):
             intrinsic_name = "foo"
@@ -406,7 +385,6 @@ class TestSubCanResolveResourceRefs(TestCase):
         self.expected_output_sub_value = "Hello ${value1} ${value2}${value3} ${value1.arn} ${value2.arn.name.foo} ${!id1.prop1} ${unknown} ${some.arn} World"
 
     def test_must_resolve_string_value(self):
-
         input = {"Fn::Sub": self.input_sub_value}
         expected = {"Fn::Sub": self.expected_output_sub_value}
 
@@ -469,7 +447,6 @@ class TestSubCanResolveResourceIdRefs(TestCase):
         self.expected_output_sub_value = "Hello ${newid1} ${newid2}${newid3} ${newid1.arn} ${newid2.arn.name.foo} ${!id1.prop1} ${unknown} ${some.arn} World"
 
     def test_must_resolve_string_value(self):
-
         input = {"Fn::Sub": self.input_sub_value}
         expected = {"Fn::Sub": self.expected_output_sub_value}
 
@@ -693,6 +670,15 @@ class TestGetAttCanResolveResourceIdRefs(TestCase):
         }
 
         expected = {"Fn::GetAtt": {"a": "b"}}
+
+        getatt = GetAttAction()
+        output = getatt.resolve_resource_id_refs(input, self.supported_resource_id_refs)
+
+        self.assertEqual(expected, output)
+
+    def test_must_ignore_non_string_types(self):
+        input = {"Fn::GetAtt": ["a", {"c": "d"}]}
+        expected = {"Fn::GetAtt": ["a", {"c": "d"}]}
 
         getatt = GetAttAction()
         output = getatt.resolve_resource_id_refs(input, self.supported_resource_id_refs)

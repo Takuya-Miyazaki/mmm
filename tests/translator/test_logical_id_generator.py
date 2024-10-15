@@ -1,8 +1,8 @@
 import hashlib
 import json
-
 from unittest import TestCase
-from mock import patch
+from unittest.mock import patch
+
 from samtranslator.translator.logical_id_generator import LogicalIdGenerator
 
 
@@ -16,7 +16,6 @@ class TestLogicalIdGenerator(TestCase):
 
     @patch.object(LogicalIdGenerator, "_stringify")
     def test_gen_no_data(self, stringify_mock):
-
         generator = LogicalIdGenerator(self.prefix)
 
         self.assertEqual(self.prefix, generator.gen())
@@ -37,7 +36,7 @@ class TestLogicalIdGenerator(TestCase):
 
         generator = LogicalIdGenerator(self.prefix, data_obj=data)
 
-        expected = "{}{}".format(self.prefix, hash_value)
+        expected = f"{self.prefix}{hash_value}"
         self.assertEqual(expected, generator.gen())
         get_hash_mock.assert_called_once_with()
         stringify_mock.assert_called_once_with(data)
@@ -53,7 +52,7 @@ class TestLogicalIdGenerator(TestCase):
 
         generator = LogicalIdGenerator(self.prefix, data_obj=data, data_hash=hash_value)
 
-        expected = "{}{}".format(self.prefix, hash_value)
+        expected = f"{self.prefix}{hash_value}"
         self.assertEqual(expected, generator.gen())
         stringify_mock.assert_called_once_with(data)
 

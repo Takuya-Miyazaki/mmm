@@ -25,7 +25,16 @@ from samtranslator.model.exceptions import InvalidResourceException
 """
 DeploymentPreferenceTuple = namedtuple(
     "DeploymentPreferenceTuple",
-    ["deployment_type", "pre_traffic_hook", "post_traffic_hook", "alarms", "enabled", "role", "trigger_configurations"],
+    [
+        "deployment_type",
+        "pre_traffic_hook",
+        "post_traffic_hook",
+        "alarms",
+        "enabled",
+        "role",
+        "trigger_configurations",
+        "condition",
+    ],
 )
 
 
@@ -37,23 +46,24 @@ class DeploymentPreference(DeploymentPreferenceTuple):
     """
 
     @classmethod
-    def from_dict(cls, logical_id, deployment_preference_dict):
+    def from_dict(cls, logical_id, deployment_preference_dict, condition=None):  # type: ignore[no-untyped-def]
         """
         :param logical_id: the logical_id of the resource that owns this deployment preference
         :param deployment_preference_dict: the dict object taken from the SAM template
+        :param condition: condition on this deployment preference
         :return:
         """
         enabled = deployment_preference_dict.get("Enabled", True)
         enabled = False if enabled in ["false", "False"] else enabled
 
         if not enabled:
-            return DeploymentPreference(None, None, None, None, False, None, None)
+            return DeploymentPreference(None, None, None, None, False, None, None, None)
 
         if "Type" not in deployment_preference_dict:
             raise InvalidResourceException(logical_id, "'DeploymentPreference' is missing required Property 'Type'")
 
         deployment_type = deployment_preference_dict["Type"]
-        hooks = deployment_preference_dict.get("Hooks", dict())
+        hooks = deployment_preference_dict.get("Hooks", {})
         if not isinstance(hooks, dict):
             raise InvalidResourceException(
                 logical_id, "'Hooks' property of 'DeploymentPreference' must be a dictionary"
@@ -64,6 +74,15 @@ class DeploymentPreference(DeploymentPreferenceTuple):
         alarms = deployment_preference_dict.get("Alarms", None)
         role = deployment_preference_dict.get("Role", None)
         trigger_configurations = deployment_preference_dict.get("TriggerConfigurations", None)
+        passthrough_condition = deployment_preference_dict.get("PassthroughCondition", False)
+
         return DeploymentPreference(
-            deployment_type, pre_traffic_hook, post_traffic_hook, alarms, enabled, role, trigger_configurations
+            deployment_type,
+            pre_traffic_hook,
+            post_traffic_hook,
+            alarms,
+            enabled,
+            role,
+            trigger_configurations,
+            condition if passthrough_condition else None,
         )

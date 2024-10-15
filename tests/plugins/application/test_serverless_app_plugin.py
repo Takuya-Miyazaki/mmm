@@ -1,10 +1,9 @@
-import boto3
-import itertools
-
-from mock import Mock, patch
 from unittest import TestCase
-from parameterized import parameterized, param
+from unittest.mock import Mock, patch
 
+import boto3
+from botocore.exceptions import ClientError
+from samtranslator.model.exceptions import InvalidResourceException
 from samtranslator.plugins.application.serverless_app_plugin import ServerlessAppPlugin
 from samtranslator.plugins.exceptions import InvalidPluginException
 
@@ -18,18 +17,17 @@ STATUS_EXPIRED = "EXPIRED"
 
 
 def mock_create_cloud_formation_template(ApplicationId=None, SemanticVersion=None):
-    message = {
+    return {
         "ApplicationId": ApplicationId,
         "SemanticVersion": SemanticVersion,
         "Status": STATUS_ACTIVE,
         "TemplateId": MOCK_TEMPLATE_ID,
         "TemplateUrl": MOCK_TEMPLATE_URL,
     }
-    return message
 
 
 def mock_get_application(ApplicationId=None, SemanticVersion=None):
-    message = {
+    return {
         "ApplicationId": ApplicationId,
         "Author": "AWS",
         "Description": "Application description",
@@ -37,18 +35,16 @@ def mock_get_application(ApplicationId=None, SemanticVersion=None):
         "ParameterDefinitions": [{"Name": "Parameter1", "ReferencedByResources": ["resource1"], "Type": "String"}],
         "SemanticVersion": SemanticVersion,
     }
-    return message
 
 
 def mock_get_cloud_formation_template(ApplicationId=None, TemplateId=None):
-    message = {
+    return {
         "ApplicationId": ApplicationId,
         "SemanticVersion": "1.0.0",
         "Status": STATUS_ACTIVE,
         "TemplateId": TemplateId,
         "TemplateUrl": MOCK_TEMPLATE_URL,
     }
-    return message
 
 
 def mock_get_region(self, service_name, region_name):
@@ -88,13 +84,35 @@ class TestServerlessAppPlugin_init(TestCase):
     @patch("botocore.client.ClientEndpointBridge._check_default_region", mock_get_region)
     def test_plugin_invalid_configuration_raises_exception(self):
         with self.assertRaises(InvalidPluginException):
-            plugin = ServerlessAppPlugin(wait_for_template_active_status=True, validate_only=True)
+            ServerlessAppPlugin(wait_for_template_active_status=True, validate_only=True)
 
     @patch("botocore.client.ClientEndpointBridge._check_default_region", mock_get_region)
     def test_plugin_accepts_parameters(self):
         parameters = {"a": "b"}
         self.plugin = ServerlessAppPlugin(parameters=parameters)
         self.assertEqual(self.plugin._parameters, parameters)
+
+
+class TestServerlessAppPlugin_sar_client_creator(TestCase):
+    def setUp(self):
+        self.client_mock = Mock()
+
+        def sar_client_creator():
+            return self.client_mock("serverlessrepo")
+
+        self.sar_client_creator = sar_client_creator
+
+    def test_lazy_load(self):
+        plugin = ServerlessAppPlugin(sar_client_creator=self.sar_client_creator)
+        self.client_mock.assert_not_called()
+
+        self.assertEqual(plugin._sar_client, self.client_mock("serverlessrepo"))
+
+    def test_not_used_when_sar_client_provided(self):
+        sar_client = Mock()
+        plugin = ServerlessAppPlugin(sar_client_creator=self.sar_client_creator, sar_client=sar_client)
+        self.assertEqual(plugin._sar_client, sar_client)
+        self.client_mock.assert_not_called()
 
 
 class TestServerlessAppPlugin_on_before_transform_template_translate(TestCase):
@@ -106,7 +124,6 @@ class TestServerlessAppPlugin_on_before_transform_template_translate(TestCase):
     @patch("botocore.client.BaseClient._make_api_call", mock_create_cloud_formation_template)
     @patch("botocore.client.ClientEndpointBridge._check_default_region", mock_get_region)
     def test_must_process_applications(self, SamTemplateMock):
-
         self.plugin = ServerlessAppPlugin(sar_client=boto3.client("serverlessrepo"))
         template_dict = {"a": "b"}
         app_resources = [
@@ -131,7 +148,6 @@ class TestServerlessAppPlugin_on_before_transform_template_translate(TestCase):
     @patch("botocore.client.BaseClient._make_api_call", mock_get_application)
     @patch("botocore.client.ClientEndpointBridge._check_default_region", mock_get_region)
     def test_must_process_applications_validate(self, SamTemplateMock):
-
         self.plugin = ServerlessAppPlugin(validate_only=True)
         template_dict = {"a": "b"}
         app_resources = [
@@ -218,10 +234,120 @@ class TestServerlessAppPlugin_on_before_transform_template_translate(TestCase):
 
         self.assertEqual("value1", output)
 
+    @patch("samtranslator.plugins.application.serverless_app_plugin.SamTemplate")
+    def test_sar_throttling_doesnt_stop_processing(self, SamTemplateMock):
+        client = Mock()
+        client.create_cloud_formation_template = Mock()
+        client.create_cloud_formation_template.side_effect = ClientError(
+            {"Error": {"Code": "TooManyRequestsException"}}, "CreateCloudFormationTemplate"
+        )
 
-class ApplicationResource(object):
-    def __init__(self, app_id="app_id", semver="1.3.5"):
-        self.properties = {"ApplicationId": app_id, "SemanticVersion": semver}
+        app_resources = [
+            ("id1", ApplicationResource(app_id="id1", semver="1.0.0", location=True)),
+        ]
+
+        sam_template = Mock()
+        SamTemplateMock.return_value = sam_template
+        sam_template.iterate = Mock()
+        sam_template.iterate.return_value = app_resources
+
+        self.plugin = ServerlessAppPlugin(sar_client=client)
+        self.plugin._can_process_application = Mock()
+        self.plugin._can_process_application.return_value = True
+        self.plugin._get_sleep_time_sec = Mock()
+        self.plugin._get_sleep_time_sec.return_value = 0.02
+        self.plugin.TEMPLATE_WAIT_TIMEOUT_SECONDS = 1.0
+
+        self.plugin.on_before_transform_template({})
+        self.assertEqual(
+            self.plugin._applications.get(ServerlessAppPlugin._make_app_key("id1", "1.0.0")).message,
+            "Resource with id [id1] is invalid. Failed to call SAR, timeout limit exceeded.",
+        )
+        # confirm we had at least two attempts to call SAR and that we executed a sleep
+        self.assertGreater(client.create_cloud_formation_template.call_count, 1)
+        self.assertGreaterEqual(self.plugin._get_sleep_time_sec.call_count, 1)
+
+    @patch("samtranslator.plugins.application.serverless_app_plugin.SamTemplate")
+    def test_unexpected_sar_error_stops_processing(self, SamTemplateMock):
+        template_dict = {"a": "b"}
+        app_resources = [
+            ("id1", ApplicationResource(app_id="id1", semver="1.0.0", location=True)),
+        ]
+
+        sam_template = Mock()
+        SamTemplateMock.return_value = sam_template
+        sam_template.iterate = Mock()
+        sam_template.iterate.return_value = app_resources
+
+        client = Mock()
+        client.create_cloud_formation_template.side_effect = ClientError(
+            {"Error": {"Code": "BadBadError"}}, "CreateCloudFormationTemplate"
+        )
+        self.plugin = ServerlessAppPlugin(sar_client=client)
+        self.plugin._can_process_application = Mock()
+        self.plugin._can_process_application.return_value = True
+
+        with self.assertRaises(ClientError):
+            self.plugin.on_before_transform_template(template_dict)
+
+    @patch("samtranslator.plugins.application.serverless_app_plugin.SamTemplate")
+    def test_sar_success_one_app(self, SamTemplateMock):
+        template_dict = {"a": "b"}
+        app_resources = [
+            ("id1", ApplicationResource(app_id="id1", semver="1.0.0", location=True)),
+        ]
+
+        sam_template = Mock()
+        SamTemplateMock.return_value = sam_template
+        sam_template.iterate = Mock()
+        sam_template.iterate.return_value = app_resources
+
+        client = Mock()
+        client.create_cloud_formation_template = Mock()
+        client.create_cloud_formation_template.return_value = {"TemplateUrl": "/URL", "Status": STATUS_ACTIVE}
+        self.plugin = ServerlessAppPlugin(sar_client=client)
+        self.plugin._can_process_application = Mock()
+        self.plugin._can_process_application.return_value = True
+        self.plugin.on_before_transform_template(template_dict)
+
+        self.assertEqual(client.create_cloud_formation_template.call_count, 1)
+
+    @patch("samtranslator.plugins.application.serverless_app_plugin.SamTemplate")
+    def test_sleep_between_sar_checks(self, SamTemplateMock):
+        template_dict = {"a": "b"}
+        client = Mock()
+
+        app_resources = [
+            ("id1", ApplicationResource(app_id="id1", semver="1.0.0", location=True)),
+        ]
+
+        sam_template = Mock()
+        SamTemplateMock.return_value = sam_template
+        sam_template.iterate = Mock()
+        sam_template.iterate.return_value = app_resources
+        client.create_cloud_formation_template = Mock()
+        client.create_cloud_formation_template.side_effect = [
+            ClientError({"Error": {"Code": "TooManyRequestsException"}}, "CreateCloudFormationTemplate"),
+            {"TemplateUrl": "/URL", "Status": STATUS_ACTIVE},
+        ]
+        self.plugin._can_process_application = Mock()
+        self.plugin._can_process_application.return_value = True
+        self.plugin = ServerlessAppPlugin(sar_client=client, wait_for_template_active_status=True, validate_only=False)
+        self.plugin._get_sleep_time_sec = Mock()
+        self.plugin._get_sleep_time_sec.return_value = 0.001
+        self.plugin.on_before_transform_template(template_dict)
+        # should have exactly two calls to SAR
+        self.assertEqual(client.create_cloud_formation_template.call_count, 2)
+        self.assertEqual(self.plugin._get_sleep_time_sec.call_count, 1)  # make sure we slept once
+
+
+class ApplicationResource:
+    def __init__(self, app_id="app_id", semver="1.3.5", location=None):
+        self.properties = (
+            {"ApplicationId": app_id, "SemanticVersion": semver}
+            if not location
+            else {"Location": {"ApplicationId": app_id, "SemanticVersion": semver}}
+        )
 
 
 # class TestServerlessAppPlugin_on_before_transform_resource(TestCase):
@@ -253,9 +379,115 @@ class ApplicationResource(object):
 
 #     self.plugin.on_before_transform_resource(app_resources[0][0], 'AWS::Serverless::Application', app_resources[0][1].properties)
 
-# class TestServerlessAppPlugin_on_after_transform_template(TestCase):
 
-#     def setUp(self):
-#         self.plugin = SeverlessAppPlugin()
+class TestServerlessAppPlugin_on_after_transform_template(TestCase):
+    def test_sar_throttling_doesnt_stop_processing(self):
+        client = Mock()
+        client.get_cloud_formation_template = Mock()
+        client.get_cloud_formation_template.side_effect = ClientError(
+            {"Error": {"Code": "TooManyRequestsException"}}, "GetCloudFormationTemplate"
+        )
+        plugin = ServerlessAppPlugin(sar_client=client, wait_for_template_active_status=True, validate_only=False)
+        plugin._get_sleep_time_sec = Mock()
+        plugin._get_sleep_time_sec.return_value = 0.02
+        plugin._in_progress_templates = [("appid", "template"), ("appid2", "template2")]
+        plugin.TEMPLATE_WAIT_TIMEOUT_SECONDS = 0.2
+        with self.assertRaises(InvalidResourceException):
+            plugin.on_after_transform_template("template")
+        # confirm we had at least two attempts to call SAR and that we executed a sleep
+        self.assertGreater(client.get_cloud_formation_template.call_count, 1)
+        self.assertGreaterEqual(plugin._get_sleep_time_sec.call_count, 1)
 
-# # TODO: test this lifecycle event
+    def test_unexpected_sar_error_stops_processing(self):
+        client = Mock()
+        client.get_cloud_formation_template = Mock()
+        client.get_cloud_formation_template.side_effect = ClientError(
+            {"Error": {"Code": "BadBadError"}}, "GetCloudFormationTemplate"
+        )
+        plugin = ServerlessAppPlugin(sar_client=client, wait_for_template_active_status=True, validate_only=False)
+        plugin._in_progress_templates = [("appid", "template")]
+        with self.assertRaises(ClientError):
+            plugin.on_after_transform_template("template")
+
+    def test_sar_success_one_app(self):
+        client = Mock()
+        client.get_cloud_formation_template = Mock()
+        client.get_cloud_formation_template.return_value = {"Status": STATUS_ACTIVE}
+        plugin = ServerlessAppPlugin(sar_client=client, wait_for_template_active_status=True, validate_only=False)
+        plugin._in_progress_templates = [("appid", "template")]
+        plugin.on_after_transform_template("template")
+        # should have exactly one call to SAR
+        self.assertEqual(client.get_cloud_formation_template.call_count, 1)
+
+    def test_sar_success_two_apps(self):
+        client = Mock()
+        client.get_cloud_formation_template = Mock()
+        client.get_cloud_formation_template.return_value = {"Status": STATUS_ACTIVE}
+        plugin = ServerlessAppPlugin(sar_client=client, wait_for_template_active_status=True, validate_only=False)
+        plugin._in_progress_templates = [("appid1", "template1"), ("appid2", "template2")]
+        plugin.on_after_transform_template("template")
+        # should have exactly one call to SAR per app
+        self.assertEqual(client.get_cloud_formation_template.call_count, 2)
+
+    def test_expired_sar_app_throws(self):
+        client = Mock()
+        client.get_cloud_formation_template = Mock()
+        client.get_cloud_formation_template.return_value = {"Status": STATUS_EXPIRED}
+        plugin = ServerlessAppPlugin(sar_client=client, wait_for_template_active_status=True, validate_only=False)
+        plugin._in_progress_templates = [("appid1", "template1"), ("appid2", "template2")]
+        with self.assertRaises(InvalidResourceException):
+            plugin.on_after_transform_template("template")
+        # should have exactly one call to SAR since the first app will be expired
+        self.assertEqual(client.get_cloud_formation_template.call_count, 1)
+
+    def test_sleep_between_sar_checks(self):
+        client = Mock()
+        client.get_cloud_formation_template = Mock()
+        client.get_cloud_formation_template.side_effect = [{"Status": STATUS_PREPARING}, {"Status": STATUS_ACTIVE}]
+        plugin = ServerlessAppPlugin(sar_client=client, wait_for_template_active_status=True, validate_only=False)
+        plugin._in_progress_templates = [("appid1", "template1")]
+        plugin._get_sleep_time_sec = Mock()
+        plugin._get_sleep_time_sec.return_value = 0.001
+        plugin.on_after_transform_template("template")
+        # should have exactly two calls to SAR
+        self.assertEqual(client.get_cloud_formation_template.call_count, 2)
+        self.assertEqual(plugin._get_sleep_time_sec.call_count, 1)  # make sure we slept once
+
+
+class TestServerlessAppPlugin_on_before_and_on_after_transform_template(TestCase):
+    @patch("samtranslator.plugins.application.serverless_app_plugin.SamTemplate")
+    def test_time_limit_exceeds_between_combined_sar_calls(self, SamTemplateMock):
+        template_dict = {"a": "b"}
+        app_resources = [
+            ("id1", ApplicationResource(app_id="id1", semver="1.0.0", location=True)),
+        ]
+
+        sam_template = Mock()
+        SamTemplateMock.return_value = sam_template
+        sam_template.iterate = Mock()
+        sam_template.iterate.return_value = app_resources
+
+        client = Mock()
+        client.get_cloud_formation_template = Mock()
+        client.get_cloud_formation_template.side_effect = [
+            ClientError({"Error": {"Code": "TooManyRequestsException"}}, "GetCloudFormationTemplate"),
+            {"Status": STATUS_ACTIVE},
+        ]
+        client.create_cloud_formation_template = Mock()
+        client.create_cloud_formation_template.side_effect = [
+            ClientError({"Error": {"Code": "TooManyRequestsException"}}, "CreateCloudFormationTemplate"),
+            {"TemplateUrl": "/URL", "Status": STATUS_ACTIVE},
+        ]
+        plugin = ServerlessAppPlugin(sar_client=client, wait_for_template_active_status=True, validate_only=False)
+        plugin._get_sleep_time_sec = Mock()
+        plugin._get_sleep_time_sec.return_value = 0.04
+        plugin._in_progress_templates = [("appid", "template"), ("appid2", "template2")]
+        plugin.TEMPLATE_WAIT_TIMEOUT_SECONDS = 0.08
+
+        plugin.on_before_transform_template(template_dict)
+        with self.assertRaises(InvalidResourceException):
+            plugin.on_after_transform_template(template_dict)
+        # confirm we had at least two attempts to call SAR and that we executed a sleep
+        self.assertEqual(client.get_cloud_formation_template.call_count, 1)
+        self.assertEqual(client.create_cloud_formation_template.call_count, 2)
+        self.assertGreaterEqual(plugin._get_sleep_time_sec.call_count, 2)

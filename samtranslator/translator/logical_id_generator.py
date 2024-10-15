@@ -1,21 +1,20 @@
 import hashlib
 import json
-import sys
-from six import string_types
+from typing import Any, Optional
 
 
-class LogicalIdGenerator(object):
-
+class LogicalIdGenerator:
     # NOTE: Changing the length of the hash will change backwards compatibility. This will break the stability contract
     #       given by this class
     HASH_LENGTH = 10
 
-    def __init__(self, prefix, data_obj=None, data_hash=None):
+    def __init__(self, prefix: str, data_obj: Optional[Any] = None, data_hash: Optional[str] = None) -> None:
         """
         Generate logical IDs for resources that are stable, deterministic and platform independent
 
         :param prefix: Prefix for the logicalId
         :param data_obj: Data object to trigger new changes on. If set to None, this is ignored
+        :param data_hash: Pre-computed hash, must be a string
         """
 
         data_str = ""
@@ -26,7 +25,7 @@ class LogicalIdGenerator(object):
         self.data_str = data_str
         self.data_hash = data_hash
 
-    def gen(self):
+    def gen(self) -> str:
         """
         Generate stable LogicalIds based on the prefix and given data. This method ensures that the logicalId is
         deterministic and stable based on input prefix & data object. In other words:
@@ -45,9 +44,9 @@ class LogicalIdGenerator(object):
         """
 
         data_hash = self.get_hash()
-        return "{prefix}{hash}".format(prefix=self._prefix, hash=data_hash)
+        return f"{self._prefix}{data_hash}"
 
-    def get_hash(self, length=HASH_LENGTH):
+    def get_hash(self, length: int = HASH_LENGTH) -> str:
         """
         Generate and return a hash of data that can be used as suffix of logicalId
 
@@ -62,20 +61,12 @@ class LogicalIdGenerator(object):
         if not self.data_str:
             return data_hash
 
-        encoded_data_str = self.data_str
-        if sys.version_info.major == 2:
-            # In Py2, only unicode needs to be encoded.
-            if isinstance(self.data_str, unicode):
-                encoded_data_str = self.data_str.encode("utf-8")
-        else:
-            # data_str should always be unicode on python 3
-            encoded_data_str = self.data_str.encode("utf-8")
-
-        data_hash = hashlib.sha1(encoded_data_str).hexdigest()
+        encoded_data_str = self.data_str.encode("utf-8")
+        data_hash = hashlib.sha1(encoded_data_str).hexdigest()  # noqa: S324
 
         return data_hash[:length]
 
-    def _stringify(self, data):
+    def _stringify(self, data: Any) -> str:
         """
         Stable, platform & language-independent stringification of a data with basic Python type.
 
@@ -87,7 +78,7 @@ class LogicalIdGenerator(object):
         :return: string representation of the dictionary
         :rtype string
         """
-        if isinstance(data, string_types):
+        if isinstance(data, str):
             return data
 
         # Get the most compact dictionary (separators) and sort the keys recursively to get a stable output

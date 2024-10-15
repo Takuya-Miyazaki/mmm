@@ -1,7 +1,7 @@
 Globals:
   Api:
     Cors:
-      AllowMethods: "methods"
+      AllowMethods: methods
 
 Resources:
   ImplicitApiFunction:
@@ -16,4 +16,8 @@ Resources:
           Properties:
             Path: /
             Method: get
-
+        AnyHtml:
+          Type: Api
+          Properties:
+            Path: /any
+            Method: any

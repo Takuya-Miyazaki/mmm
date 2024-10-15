@@ -1,15 +1,19 @@
-from enum import Enum
 from collections import namedtuple
+from enum import Enum
+from typing import Any, Dict, List
 
-from six import string_types
-
-from samtranslator.model.intrinsics import is_intrinsic, is_intrinsic_if, is_intrinsic_no_value
 from samtranslator.model.exceptions import InvalidTemplateException
+from samtranslator.model.intrinsics import (
+    is_intrinsic,
+    is_intrinsic_if,
+    is_intrinsic_no_value,
+    validate_intrinsic_if_items,
+)
 
 PolicyEntry = namedtuple("PolicyEntry", "data type")
 
 
-class ResourcePolicies(object):
+class ResourcePolicies:
     """
     Class encapsulating the policies property of SAM resources. This class strictly encapsulates the data
     and does not take opinions on how to handle them.
@@ -25,7 +29,7 @@ class ResourcePolicies(object):
 
     POLICIES_PROPERTY_NAME = "Policies"
 
-    def __init__(self, resource_properties, policy_template_processor=None):
+    def __init__(self, resource_properties: Dict[str, Any], policy_template_processor: Any = None) -> None:
         """
         Initialize with policies data from resource's properties
 
@@ -40,20 +44,19 @@ class ResourcePolicies(object):
         # Build the list of policies upon construction.
         self.policies = self._get_policies(resource_properties)
 
-    def get(self):
+    def get(self):  # type: ignore[no-untyped-def]
         """
         Iterator method that "yields" the next policy entry on subsequent calls to this method.
 
         :yields namedtuple("data", "type"): Yields a named tuple containing the policy data and its type
         """
 
-        for policy_tuple in self.policies:
-            yield policy_tuple
+        yield from self.policies
 
-    def __len__(self):
+    def __len__(self):  # type: ignore[no-untyped-def]
         return len(self.policies)
 
-    def _get_policies(self, resource_properties):
+    def _get_policies(self, resource_properties: Dict[str, Any]) -> List[Any]:
         """
         Returns a list of policies from the resource properties. This method knows how to interpret and handle
         polymorphic nature of the policies property.
@@ -75,7 +78,7 @@ class ResourcePolicies(object):
 
         policies = None
 
-        if self._contains_policies(resource_properties):
+        if self._contains_policies(resource_properties):  # type: ignore[no-untyped-call]
             policies = resource_properties[self.POLICIES_PROPERTY_NAME]
 
         if not policies:
@@ -88,13 +91,13 @@ class ResourcePolicies(object):
 
         result = []
         for policy in policies:
-            policy_type = self._get_type(policy)
+            policy_type = self._get_type(policy)  # type: ignore[no-untyped-call]
             entry = PolicyEntry(data=policy, type=policy_type)
             result.append(entry)
 
         return result
 
-    def _contains_policies(self, resource_properties):
+    def _contains_policies(self, resource_properties):  # type: ignore[no-untyped-def]
         """
         Is there policies data in this resource?
 
@@ -107,7 +110,7 @@ class ResourcePolicies(object):
             and self.POLICIES_PROPERTY_NAME in resource_properties
         )
 
-    def _get_type(self, policy):
+    def _get_type(self, policy):  # type: ignore[no-untyped-def]
         """
         Returns the type of the given policy
 
@@ -118,12 +121,12 @@ class ResourcePolicies(object):
         # Must handle intrinsic functions. Policy could be a primitive type or an intrinsic function
 
         # Managed policies are of type string
-        if isinstance(policy, string_types):
+        if isinstance(policy, str):
             return PolicyTypes.MANAGED_POLICY
 
         # Handle the special case for 'if' intrinsic function
         if is_intrinsic_if(policy):
-            return self._get_type_from_intrinsic_if(policy)
+            return self._get_type_from_intrinsic_if(policy)  # type: ignore[no-untyped-call]
 
         # Intrinsic functions are treated as managed policies by default
         if is_intrinsic(policy):
@@ -134,13 +137,13 @@ class ResourcePolicies(object):
             return PolicyTypes.POLICY_STATEMENT
 
         # This could be a policy template then.
-        if self._is_policy_template(policy):
+        if self._is_policy_template(policy):  # type: ignore[no-untyped-call]
             return PolicyTypes.POLICY_TEMPLATE
 
         # Nothing matches. Don't take opinions on how to handle it. Instead just set the appropriate type.
         return PolicyTypes.UNKNOWN
 
-    def _is_policy_template(self, policy):
+    def _is_policy_template(self, policy):  # type: ignore[no-untyped-def]
         """
         Is the given policy data a policy template? Policy templates is a dictionary with one key which is the name
         of the template.
@@ -153,10 +156,10 @@ class ResourcePolicies(object):
             self._policy_template_processor is not None
             and isinstance(policy, dict)
             and len(policy) == 1
-            and self._policy_template_processor.has(list(policy.keys())[0]) is True
+            and self._policy_template_processor.has(next(iter(policy.keys()))) is True
         )
 
-    def _get_type_from_intrinsic_if(self, policy):
+    def _get_type_from_intrinsic_if(self, policy):  # type: ignore[no-untyped-def]
         """
         Returns the type of the given policy assuming that it is an intrinsic if function
 
@@ -165,14 +168,16 @@ class ResourcePolicies(object):
         """
         intrinsic_if_value = policy["Fn::If"]
 
-        if not len(intrinsic_if_value) == 3:
-            raise InvalidTemplateException("Fn::If requires 3 arguments")
+        try:
+            validate_intrinsic_if_items(intrinsic_if_value)
+        except ValueError as e:
+            raise InvalidTemplateException(str(e)) from e
 
         if_data = intrinsic_if_value[1]
         else_data = intrinsic_if_value[2]
 
-        if_data_type = self._get_type(if_data)
-        else_data_type = self._get_type(else_data)
+        if_data_type = self._get_type(if_data)  # type: ignore[no-untyped-call]
+        else_data_type = self._get_type(else_data)  # type: ignore[no-untyped-call]
 
         if if_data_type == else_data_type:
             return if_data_type

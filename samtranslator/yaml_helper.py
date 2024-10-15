@@ -1,18 +1,17 @@
 import yaml
 from yaml import ScalarNode, SequenceNode
-from six import string_types
 
 # This helper copied almost entirely from
 # https://github.com/aws/aws-cli/blob/develop/awscli/customizations/cloudformation/yamlhelper.py
 
 
-def yaml_parse(yamlstr):
+def yaml_parse(yamlstr):  # type: ignore[no-untyped-def]
     """Parse a yaml string"""
-    yaml.SafeLoader.add_multi_constructor("!", intrinsics_multi_constructor)
+    yaml.SafeLoader.add_multi_constructor("!", intrinsics_multi_constructor)  # type: ignore[no-untyped-call]
     return yaml.safe_load(yamlstr)
 
 
-def intrinsics_multi_constructor(loader, tag_prefix, node):
+def intrinsics_multi_constructor(loader, tag_prefix, node):  # type: ignore[no-untyped-def]
     """
     YAML constructor to parse CloudFormation intrinsics.
     This will return a dictionary with key being the instrinsic name
@@ -28,7 +27,7 @@ def intrinsics_multi_constructor(loader, tag_prefix, node):
 
     cfntag = prefix + tag
 
-    if tag == "GetAtt" and isinstance(node.value, string_types):
+    if tag == "GetAtt" and isinstance(node.value, str):
         # ShortHand notation for !GetAtt accepts Resource.Attribute format
         # while the standard notation is to use an array
         # [Resource, Attribute]. Convert shorthand to standard format

@@ -1,10 +1,12 @@
-from samtranslator.model import PropertyType, Resource
-from samtranslator.model.types import is_type
-from samtranslator.model.intrinsics import ref, fnGetAtt
+from samtranslator.model import GeneratedProperty, Resource
+from samtranslator.model.intrinsics import fnGetAtt, ref
 
 
 class IotTopicRule(Resource):
     resource_type = "AWS::IoT::TopicRule"
-    property_types = {"TopicRulePayload": PropertyType(False, is_type(dict))}
+    property_types = {
+        "TopicRulePayload": GeneratedProperty(),
+        "Tags": GeneratedProperty(),
+    }
 
     runtime_attrs = {"name": lambda self: ref(self.logical_id), "arn": lambda self: fnGetAtt(self.logical_id, "Arn")}

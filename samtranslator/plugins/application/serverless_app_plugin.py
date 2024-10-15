@@ -1,24 +1,35 @@
-import boto3
-import json
-from botocore.exceptions import ClientError, EndpointConnectionError
-import logging
-from time import sleep, time
 import copy
+import json
+import logging
+import re
+from time import sleep
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import boto3
+from botocore.client import BaseClient
+from botocore.config import Config
+from botocore.exceptions import ClientError, EndpointConnectionError
+
+from samtranslator.intrinsics.actions import FindInMapAction
+from samtranslator.intrinsics.resolver import IntrinsicsResolver
+from samtranslator.metrics.method_decorator import cw_timer
 from samtranslator.model.exceptions import InvalidResourceException
 from samtranslator.plugins import BasePlugin
 from samtranslator.plugins.exceptions import InvalidPluginException
 from samtranslator.public.sdk.resource import SamResourceType
 from samtranslator.public.sdk.template import SamTemplate
-from samtranslator.intrinsics.resolver import IntrinsicsResolver
-from samtranslator.intrinsics.actions import FindInMapAction
+from samtranslator.region_configuration import RegionConfiguration
+from samtranslator.utils.constants import BOTO3_CONNECT_TIMEOUT
+from samtranslator.validator.value_validator import sam_expect
 
 LOG = logging.getLogger(__name__)
+
+PLUGIN_METRICS_PREFIX = "Plugin-ServerlessApp"
 
 
 class ServerlessAppPlugin(BasePlugin):
     """
-    Resolves all of the ApplicationId and Semantic Version pairs
+    Resolves all the ApplicationId and Semantic Version pairs
     for AWS::Serverless::Application to template URLs.
 
     To retrieve a template from the Serverless Application Repository (SAR),
@@ -41,7 +52,14 @@ class ServerlessAppPlugin(BasePlugin):
     LOCATION_KEY = "Location"
     TEMPLATE_URL_KEY = "TemplateUrl"
 
-    def __init__(self, sar_client=None, wait_for_template_active_status=False, validate_only=False, parameters={}):
+    def __init__(
+        self,
+        sar_client: Optional[BaseClient] = None,
+        wait_for_template_active_status: bool = False,
+        validate_only: bool = False,
+        parameters: Optional[Dict[str, Any]] = None,
+        sar_client_creator: Optional[Callable[[], BaseClient]] = None,
+    ) -> None:
         """
         Initialize the plugin.
 
@@ -49,21 +67,45 @@ class ServerlessAppPlugin(BasePlugin):
         :param boto3.client sar_client: The boto3 client to use to access the Serverless Application Repository
         :param bool wait_for_template_active_status: Flag to wait for all templates to become active
         :param bool validate_only: Flag to only validate application access (uses get_application API instead)
+        :param bool sar_client_creator: A function to return a SAR client.
+                                        Only used when sar_client is None and SAR calls are made.
         """
-        super(ServerlessAppPlugin, self).__init__(ServerlessAppPlugin.__name__)
-        self._applications = {}
-        self._in_progress_templates = []
-        self._sar_client = sar_client
+        super().__init__()
+        if parameters is None:
+            parameters = {}
+        self._applications: Dict[Tuple[str, str], Any] = {}
+        self._in_progress_templates: List[Tuple[str, str]] = []
+        self.__sar_client = sar_client
+        self._sar_client_creator = sar_client_creator
         self._wait_for_template_active_status = wait_for_template_active_status
         self._validate_only = validate_only
         self._parameters = parameters
+        self._total_wait_time = 0
 
         # make sure the flag combination makes sense
         if self._validate_only is True and self._wait_for_template_active_status is True:
             message = "Cannot set both validate_only and wait_for_template_active_status flags to True."
             raise InvalidPluginException(ServerlessAppPlugin.__name__, message)
 
-    def on_before_transform_template(self, template_dict):
+    @property
+    def _sar_client(self) -> BaseClient:
+        # Lazy initialization of the client-create it when it is needed
+        if not self.__sar_client:
+            if self._sar_client_creator:
+                self.__sar_client = self._sar_client_creator()
+            else:
+                # a SAR call could take a while to finish, leaving the read_timeout default (60s).
+                client_config = Config(connect_timeout=BOTO3_CONNECT_TIMEOUT)
+                self.__sar_client = boto3.client("serverlessrepo", config=client_config)
+        return self.__sar_client
+
+    @staticmethod
+    def _make_app_key(app_id: Any, semver: Any) -> Tuple[str, str]:
+        """Generate a key that is always hashable."""
+        return json.dumps(app_id, default=str), json.dumps(semver, default=str)
+
+    @cw_timer(prefix=PLUGIN_METRICS_PREFIX)
+    def on_before_transform_template(self, template_dict):  # type: ignore[no-untyped-def]
         """
         Hook method that gets called before the SAM template is processed.
         The template has passed the validation and is guaranteed to contain a non-empty "Resources" section.
@@ -72,64 +114,93 @@ class ServerlessAppPlugin(BasePlugin):
         This verifies that the user has access to all specified applications.
 
         :param dict template_dict: Dictionary of the SAM template
-        :return: Nothing
         """
         template = SamTemplate(template_dict)
-        intrinsic_resolvers = self._get_intrinsic_resolvers(template_dict.get("Mappings", {}))
+        intrinsic_resolvers = self._get_intrinsic_resolvers(template_dict.get("Mappings", {}))  # type: ignore[no-untyped-call]
 
         service_call = None
-        if self._validate_only:
-            service_call = self._handle_get_application_request
-        else:
-            service_call = self._handle_create_cfn_template_request
+        service_call = (
+            self._handle_get_application_request if self._validate_only else self._handle_create_cfn_template_request
+        )
         for logical_id, app in template.iterate({SamResourceType.Application.value}):
-            if not self._can_process_application(app):
+            if not self._can_process_application(app):  # type: ignore[no-untyped-call]
                 # Handle these cases in the on_before_transform_resource event
                 continue
 
-            app_id = self._replace_value(
+            app_id = self._replace_value(  # type: ignore[no-untyped-call]
                 app.properties[self.LOCATION_KEY], self.APPLICATION_ID_KEY, intrinsic_resolvers
             )
 
-            semver = self._replace_value(
+            semver = self._replace_value(  # type: ignore[no-untyped-call]
                 app.properties[self.LOCATION_KEY], self.SEMANTIC_VERSION_KEY, intrinsic_resolvers
             )
 
+            key = self._make_app_key(app_id, semver)
+
             if isinstance(app_id, dict) or isinstance(semver, dict):
-                key = (json.dumps(app_id), json.dumps(semver))
                 self._applications[key] = False
                 continue
 
-            key = (app_id, semver)
-
             if key not in self._applications:
                 try:
-                    # Lazy initialization of the client- create it when it is needed
-                    if not self._sar_client:
-                        self._sar_client = boto3.client("serverlessrepo")
-                    service_call(app_id, semver, key, logical_id)
+                    # Examine the type of ApplicationId and SemanticVersion
+                    # before calling SAR API.
+                    sam_expect(app_id, logical_id, "Location.ApplicationId").to_be_a_string()
+                    sam_expect(semver, logical_id, "Location.SemanticVersion").to_be_a_string()
+                    if not RegionConfiguration.is_service_supported("serverlessrepo"):  # type: ignore[no-untyped-call]
+                        raise InvalidResourceException(
+                            logical_id, "Serverless Application Repository is not available in this region."
+                        )
+                    # SSM Pattern found here https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/dynamic-references.html
+                    ssm_pattern = r"{{resolve:ssm:[a-zA-Z0-9_.\-/]+(:\d+)?}}"
+                    if re.search(ssm_pattern, app_id):
+                        raise InvalidResourceException(
+                            logical_id,
+                            "Serverless Application Repostiory does not support dynamic reference in 'ApplicationId' property.",
+                        )
+
+                    self._make_service_call_with_retry(service_call, app_id, semver, key, logical_id)  # type: ignore[no-untyped-call]
                 except InvalidResourceException as e:
                     # Catch all InvalidResourceExceptions, raise those in the before_resource_transform target.
                     self._applications[key] = e
 
-    def _replace_value(self, input_dict, key, intrinsic_resolvers):
-        value = self._resolve_location_value(input_dict.get(key), intrinsic_resolvers)
+    def _make_service_call_with_retry(self, service_call, app_id, semver, key, logical_id):  # type: ignore[no-untyped-def]
+        call_succeeded = False
+        while self._total_wait_time < self.TEMPLATE_WAIT_TIMEOUT_SECONDS:
+            try:
+                service_call(app_id, semver, key, logical_id)
+            except ClientError as e:
+                error_code = e.response["Error"]["Code"]
+                if error_code == "TooManyRequestsException":
+                    LOG.debug(f"SAR call timed out for application id {app_id}")
+                    sleep_time = self._get_sleep_time_sec()
+                    sleep(sleep_time)
+                    self._total_wait_time += sleep_time
+                    continue
+                raise e
+            call_succeeded = True
+            break
+        if not call_succeeded:
+            raise InvalidResourceException(logical_id, "Failed to call SAR, timeout limit exceeded.")
+
+    def _replace_value(self, input_dict, key, intrinsic_resolvers):  # type: ignore[no-untyped-def]
+        value = self._resolve_location_value(input_dict.get(key), intrinsic_resolvers)  # type: ignore[no-untyped-call]
         input_dict[key] = value
         return value
 
-    def _get_intrinsic_resolvers(self, mappings):
+    def _get_intrinsic_resolvers(self, mappings):  # type: ignore[no-untyped-def]
         return [
             IntrinsicsResolver(self._parameters),
             IntrinsicsResolver(mappings, {FindInMapAction.intrinsic_name: FindInMapAction()}),
         ]
 
-    def _resolve_location_value(self, value, intrinsic_resolvers):
+    def _resolve_location_value(self, value, intrinsic_resolvers):  # type: ignore[no-untyped-def]
         resolved_value = copy.deepcopy(value)
         for intrinsic_resolver in intrinsic_resolvers:
             resolved_value = intrinsic_resolver.resolve_parameter_refs(resolved_value)
         return resolved_value
 
-    def _can_process_application(self, app):
+    def _can_process_application(self, app):  # type: ignore[no-untyped-def]
         """
         Determines whether or not the on_before_transform_template event can process this application
 
@@ -144,7 +215,7 @@ class ServerlessAppPlugin(BasePlugin):
             and app.properties[self.LOCATION_KEY][self.SEMANTIC_VERSION_KEY] is not None
         )
 
-    def _handle_get_application_request(self, app_id, semver, key, logical_id):
+    def _handle_get_application_request(self, app_id, semver, key, logical_id):  # type: ignore[no-untyped-def]
         """
         Method that handles the get_application API call to the serverless application repo
 
@@ -156,19 +227,18 @@ class ServerlessAppPlugin(BasePlugin):
         :param string key: The dictionary key consisting of (ApplicationId, SemanticVersion)
         :param string logical_id: the logical_id of this application resource
         """
-        get_application = lambda app_id, semver: self._sar_client.get_application(
-            ApplicationId=self._sanitize_sar_str_param(app_id), SemanticVersion=self._sanitize_sar_str_param(semver)
-        )
+        LOG.info(f"Getting application {app_id}/{semver} from serverless application repo...")
         try:
-            self._sar_service_call(get_application, logical_id, app_id, semver)
+            self._sar_service_call(self._get_application, logical_id, app_id, semver)
             self._applications[key] = {"Available"}
+            LOG.info(f"Finished getting application {app_id}/{semver}.")
         except EndpointConnectionError as e:
             # No internet connection. Don't break verification, but do show a warning.
-            warning_message = "{}. Unable to verify access to {}/{}.".format(e, app_id, semver)
+            warning_message = f"{e}. Unable to verify access to {app_id}/{semver}."
             LOG.warning(warning_message)
             self._applications[key] = {"Unable to verify"}
 
-    def _handle_create_cfn_template_request(self, app_id, semver, key, logical_id):
+    def _handle_create_cfn_template_request(self, app_id, semver, key, logical_id):  # type: ignore[no-untyped-def]
         """
         Method that handles the create_cloud_formation_template API call to the serverless application repo
 
@@ -177,15 +247,15 @@ class ServerlessAppPlugin(BasePlugin):
         :param string key: The dictionary key consisting of (ApplicationId, SemanticVersion)
         :param string logical_id: the logical_id of this application resource
         """
-        create_cfn_template = lambda app_id, semver: self._sar_client.create_cloud_formation_template(
-            ApplicationId=self._sanitize_sar_str_param(app_id), SemanticVersion=self._sanitize_sar_str_param(semver)
-        )
-        response = self._sar_service_call(create_cfn_template, logical_id, app_id, semver)
+        LOG.info(f"Requesting to create CFN template {app_id}/{semver} in serverless application repo...")
+        response = self._sar_service_call(self._create_cfn_template, logical_id, app_id, semver)
+
+        LOG.info(f"Requested to create CFN template {app_id}/{semver} in serverless application repo.")
         self._applications[key] = response[self.TEMPLATE_URL_KEY]
         if response["Status"] != "ACTIVE":
             self._in_progress_templates.append((response[self.APPLICATION_ID_KEY], response["TemplateId"]))
 
-    def _sanitize_sar_str_param(self, param):
+    def _sanitize_sar_str_param(self, param):  # type: ignore[no-untyped-def]
         """
         Sanitize SAR API parameter expected to be a string.
 
@@ -200,7 +270,8 @@ class ServerlessAppPlugin(BasePlugin):
             return None
         return str(param)
 
-    def on_before_transform_resource(self, logical_id, resource_type, resource_properties):
+    @cw_timer(prefix=PLUGIN_METRICS_PREFIX)
+    def on_before_transform_resource(self, logical_id, resource_type, resource_properties):  # type: ignore[no-untyped-def]
         """
         Hook method that gets called before "each" SAM resource gets processed
 
@@ -209,14 +280,13 @@ class ServerlessAppPlugin(BasePlugin):
         :param string logical_id: Logical ID of the resource being processed
         :param string resource_type: Type of the resource being processed
         :param dict resource_properties: Properties of the resource
-        :return: Nothing
         """
 
-        if not self._resource_is_supported(resource_type):
+        if not self._resource_is_supported(resource_type):  # type: ignore[no-untyped-call]
             return
 
         # Sanitize properties
-        self._check_for_dictionary_key(logical_id, resource_properties, [self.LOCATION_KEY])
+        self._check_for_dictionary_key(logical_id, resource_properties, [self.LOCATION_KEY])  # type: ignore[no-untyped-call]
 
         # If location isn't a dictionary, don't modify the resource.
         if not isinstance(resource_properties[self.LOCATION_KEY], dict):
@@ -224,14 +294,12 @@ class ServerlessAppPlugin(BasePlugin):
             return
 
         # If it is a dictionary, check for other required parameters
-        self._check_for_dictionary_key(
+        self._check_for_dictionary_key(  # type: ignore[no-untyped-call]
             logical_id, resource_properties[self.LOCATION_KEY], [self.APPLICATION_ID_KEY, self.SEMANTIC_VERSION_KEY]
         )
 
         app_id = resource_properties[self.LOCATION_KEY].get(self.APPLICATION_ID_KEY)
-
-        if not app_id:
-            raise InvalidResourceException(logical_id, "Property 'ApplicationId' cannot be blank.")
+        app_id = sam_expect(app_id, logical_id, "ApplicationId").to_not_be_none()
 
         if isinstance(app_id, dict):
             raise InvalidResourceException(
@@ -252,7 +320,7 @@ class ServerlessAppPlugin(BasePlugin):
                 "and Ref intrinsic functions are supported.",
             )
 
-        key = (app_id, semver)
+        key = self._make_app_key(app_id, semver)
 
         # Throw any resource exceptions saved from the before_transform_template event
         if isinstance(self._applications[key], InvalidResourceException):
@@ -262,7 +330,7 @@ class ServerlessAppPlugin(BasePlugin):
         if not self._validate_only:
             resource_properties[self.TEMPLATE_URL_KEY] = self._applications[key]
 
-    def _check_for_dictionary_key(self, logical_id, dictionary, keys):
+    def _check_for_dictionary_key(self, logical_id, dictionary, keys):  # type: ignore[no-untyped-def]
         """
         Checks a dictionary to make sure it has a specific key. If it does not, an
         InvalidResourceException is thrown.
@@ -273,70 +341,86 @@ class ServerlessAppPlugin(BasePlugin):
         """
         for key in keys:
             if key not in dictionary:
-                raise InvalidResourceException(
-                    logical_id, "Resource is missing the required [{}] " "property.".format(key)
-                )
+                raise InvalidResourceException(logical_id, f"Resource is missing the required [{key}] property.")
 
-    def on_after_transform_template(self, template):
+    @cw_timer(prefix=PLUGIN_METRICS_PREFIX)
+    def on_after_transform_template(self, template):  # type: ignore[no-untyped-def]
         """
         Hook method that gets called after the template is processed
 
         Go through all the stored applications and make sure they're all ACTIVE.
 
         :param dict template: Dictionary of the SAM template
-        :return: Nothing
         """
-        if self._wait_for_template_active_status and not self._validate_only:
-            start_time = time()
-            while (time() - start_time) < self.TEMPLATE_WAIT_TIMEOUT_SECONDS:
-                temp = self._in_progress_templates
-                self._in_progress_templates = []
+        if not self._wait_for_template_active_status or self._validate_only:
+            return
 
-                # Check each resource to make sure it's active
-                for application_id, template_id in temp:
-                    get_cfn_template = (
-                        lambda application_id, template_id: self._sar_client.get_cloud_formation_template(
-                            ApplicationId=self._sanitize_sar_str_param(application_id),
-                            TemplateId=self._sanitize_sar_str_param(template_id),
-                        )
+        while self._total_wait_time < self.TEMPLATE_WAIT_TIMEOUT_SECONDS:
+            # Check each resource to make sure it's active
+            LOG.info("Checking resources in serverless application repo...")
+            idx = 0
+            while idx < len(self._in_progress_templates):
+                application_id, template_id = self._in_progress_templates[idx]
+
+                try:
+                    response = self._sar_service_call(
+                        self._get_cfn_template, application_id, application_id, template_id
                     )
-                    response = self._sar_service_call(get_cfn_template, application_id, application_id, template_id)
-                    self._handle_get_cfn_template_response(response, application_id, template_id)
+                except ClientError as e:
+                    error_code = e.response["Error"]["Code"]
+                    if error_code == "TooManyRequestsException":
+                        LOG.debug(f"SAR call timed out for application id {application_id}")
+                        break  # We were throttled by SAR, break out to a sleep
+                    raise e
 
-                # Don't sleep if there are no more templates with PREPARING status
-                if len(self._in_progress_templates) == 0:
-                    break
+                if self._is_template_active(response, application_id, template_id):
+                    self._in_progress_templates.remove((application_id, template_id))
+                else:
+                    idx += 1  # check next template
 
-                # Sleep a little so we don't spam service calls
-                sleep(self.SLEEP_TIME_SECONDS)
+            LOG.info("Finished checking resources in serverless application repo.")
 
-            # Not all templates reached active status
-            if len(self._in_progress_templates) != 0:
-                application_ids = [items[0] for items in self._in_progress_templates]
-                raise InvalidResourceException(
-                    application_ids, "Timed out waiting for nested stack templates " "to reach ACTIVE status."
-                )
+            # Don't sleep if there are no more templates with PREPARING status
+            if len(self._in_progress_templates) == 0:
+                break
 
-    def _handle_get_cfn_template_response(self, response, application_id, template_id):
+            # Sleep a little so we don't spam service calls
+            sleep_time = self._get_sleep_time_sec()
+            sleep(sleep_time)
+            self._total_wait_time += sleep_time
+
+        # Not all templates reached active status
+        if len(self._in_progress_templates) != 0:
+            application_ids = [items[0] for items in self._in_progress_templates]
+            raise InvalidResourceException(
+                application_ids, "Timed out waiting for nested stack templates to reach ACTIVE status."
+            )
+
+    def _get_sleep_time_sec(self) -> int:
+        return self.SLEEP_TIME_SECONDS
+
+    def _is_template_active(self, response: Dict[str, Any], application_id: str, template_id: str) -> bool:
         """
-        Handles the response from the SAR service call
+        Checks the response from a SAR service call; returns True if the template is active,
+        throws an exception if the request expired and returns False in all other cases.
 
         :param dict response: the response dictionary from the app repo
         :param string application_id: the ApplicationId
         :param string template_id: the unique TemplateId for this application
         """
-        status = response["Status"]
-        if status != "ACTIVE":
-            # Other options are PREPARING and EXPIRED.
-            if status == "EXPIRED":
-                message = (
-                    "Template for {} with id {} returned status: {}. Cannot access an expired "
-                    "template.".format(application_id, template_id, status)
-                )
-                raise InvalidResourceException(application_id, message)
-            self._in_progress_templates.append((application_id, template_id))
+        status: str = response["Status"]  # options: PREPARING, EXPIRED or ACTIVE
 
-    def _sar_service_call(self, service_call_lambda, logical_id, *args):
+        if status == "EXPIRED":
+            message = (
+                f"Template for {application_id} with id {template_id} returned status: {status}. "
+                "Cannot access an expired template."
+            )
+            raise InvalidResourceException(application_id, message)
+
+        return status == "ACTIVE"
+
+    @cw_timer(prefix="External", name="SAR")
+    def _sar_service_call(self, service_call_lambda, logical_id, *args):  # type: ignore[no-untyped-def]
         """
         Handles service calls and exception management for service calls
         to the Serverless Application Repository.
@@ -346,19 +430,14 @@ class ServerlessAppPlugin(BasePlugin):
         :param list *args: arguments for the service call lambda
         """
         try:
-            response = service_call_lambda(*args)
-            LOG.info(response)
-            return response
+            return service_call_lambda(*args)
         except ClientError as e:
             error_code = e.response["Error"]["Code"]
             if error_code in ("AccessDeniedException", "NotFoundException"):
-                raise InvalidResourceException(logical_id, e.response["Error"]["Message"])
-
-            # 'ForbiddenException'- SAR rejects connection
-            LOG.exception(e)
+                raise InvalidResourceException(logical_id, e.response["Error"]["Message"]) from e
             raise e
 
-    def _resource_is_supported(self, resource_type):
+    def _resource_is_supported(self, resource_type):  # type: ignore[no-untyped-def]
         """
         Is this resource supported by this plugin?
 
@@ -366,3 +445,19 @@ class ServerlessAppPlugin(BasePlugin):
         :return: True, if this plugin supports this resource. False otherwise
         """
         return resource_type == self.SUPPORTED_RESOURCE_TYPE
+
+    def _get_application(self, app_id, semver):  # type: ignore[no-untyped-def]
+        return self._sar_client.get_application(  # type: ignore[attr-defined]
+            ApplicationId=self._sanitize_sar_str_param(app_id), SemanticVersion=self._sanitize_sar_str_param(semver)  # type: ignore[no-untyped-call]
+        )
+
+    def _create_cfn_template(self, app_id, semver):  # type: ignore[no-untyped-def]
+        return self._sar_client.create_cloud_formation_template(  # type: ignore[attr-defined]
+            ApplicationId=self._sanitize_sar_str_param(app_id), SemanticVersion=self._sanitize_sar_str_param(semver)  # type: ignore[no-untyped-call]
+        )
+
+    def _get_cfn_template(self, app_id, template_id):  # type: ignore[no-untyped-def]
+        return self._sar_client.get_cloud_formation_template(  # type: ignore[attr-defined]
+            ApplicationId=self._sanitize_sar_str_param(app_id),  # type: ignore[no-untyped-call]
+            TemplateId=self._sanitize_sar_str_param(template_id),  # type: ignore[no-untyped-call]
+        )

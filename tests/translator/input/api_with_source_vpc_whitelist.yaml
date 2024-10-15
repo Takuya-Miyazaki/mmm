@@ -7,9 +7,9 @@ Globals:
   Api:
     Auth:
       ResourcePolicy:
-        SourceVpcWhitelist: 
-          - !Ref Vpc1
-          - vpc-5678
+        SourceVpcWhitelist:
+        - !Ref Vpc1
+        - vpc-5678
 
 Resources:
   MyFunction:
@@ -31,14 +31,23 @@ Resources:
           Properties:
             Method: Put
             Path: /get
+        ApiAnyMethod:
+          Type: Api
+          Properties:
+            Method: any
+            Path: /any/get
         Fetch:
           Type: Api
           Properties:
             Method: Post
             Path: /fetch
+        FetchAnyMethod:
+          Type: Api
+          Properties:
+            Method: any
+            Path: /any/fetch
 
   MyApi:
     Type: AWS::Serverless::Api
     Properties:
       StageName: Prod
-

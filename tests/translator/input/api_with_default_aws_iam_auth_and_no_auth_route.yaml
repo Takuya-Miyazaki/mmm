@@ -1,6 +1,6 @@
 Resources:
   MyApiWithAwsIamAuth:
-    Type: "AWS::Serverless::Api"
+    Type: AWS::Serverless::Api
     Properties:
       StageName: Prod
       Auth:
@@ -19,6 +19,12 @@ Resources:
             RestApiId: !Ref MyApiWithAwsIamAuth
             Path: /
             Method: post
+        MyApiWithAwsIamAuthAnyMethod:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MyApiWithAwsIamAuth
+            Path: /any/iam
+            Method: any
         MyApiWithNoAuth:
           Type: Api
           Properties:
@@ -26,4 +32,12 @@ Resources:
             Path: /
             Method: get
             Auth:
-              Authorizer: 'NONE'
+              Authorizer: NONE
+        MyApiWithNoAuthAnyMethod:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MyApiWithAwsIamAuth
+            Path: /any/none
+            Method: any
+            Auth:
+              Authorizer: NONE

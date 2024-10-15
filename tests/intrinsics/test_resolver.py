@@ -1,7 +1,8 @@
 from unittest import TestCase
-from mock import Mock, patch
-from samtranslator.intrinsics.resolver import IntrinsicsResolver
+from unittest.mock import Mock, patch
+
 from samtranslator.intrinsics.actions import Action
+from samtranslator.intrinsics.resolver import IntrinsicsResolver
 from samtranslator.model.exceptions import InvalidDocumentException
 
 
@@ -192,12 +193,6 @@ class TestSupportedIntrinsics(TestCase):
         with self.assertRaises(TypeError):
             IntrinsicsResolver({}, supported_intrinsics)
 
-    def test_configure_supported_intrinsics_must_error_for_none_input(self):
-
-        with self.assertRaises(TypeError):
-            IntrinsicsResolver({}, None)
-
     def test_configure_supported_intrinsics_must_error_for_non_dict_input(self):
-
         with self.assertRaises(TypeError):
             IntrinsicsResolver({}, [1, 2, 3])

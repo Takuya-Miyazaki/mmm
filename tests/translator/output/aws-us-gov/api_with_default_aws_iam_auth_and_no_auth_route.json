@@ -1,124 +1,93 @@
 {
   "Resources": {
-    "MyFunctionWithAwsIamAuth": {
-      "Type": "AWS::Lambda::Function",
-      "Properties": {
-        "Handler": "index.handler",
-        "Code": {
-          "S3Bucket": "bucket",
-          "S3Key": "key"
-        },
-        "Role": {
-          "Fn::GetAtt": [
-            "MyFunctionWithAwsIamAuthRole",
-            "Arn"
-          ]
-        },
-        "Runtime": "nodejs12.x",
-        "Tags": [
-          {
-            "Value": "SAM",
-            "Key": "lambda:createdBy"
-          }
-        ]
-      }
-    },
-    "MyFunctionWithAwsIamAuthMyApiWithNoAuthPermissionProd": {
-      "Type": "AWS::Lambda::Permission",
-      "Properties": {
-        "Action": "lambda:InvokeFunction",
-        "Principal": "apigateway.amazonaws.com",
-        "FunctionName": {
-          "Ref": "MyFunctionWithAwsIamAuth"
-        },
-        "SourceArn": {
-          "Fn::Sub": [
-            "arn:aws-us-gov:execute-api:${AWS::Region}:${AWS::AccountId}:${__ApiId__}/${__Stage__}/GET/",
-            {
-              "__Stage__": "*",
-              "__ApiId__": {
-                "Ref": "MyApiWithAwsIamAuth"
-              }
-            }
-          ]
-        }
-      }
-    },
-    "MyFunctionWithAwsIamAuthMyApiWithAwsIamAuthPermissionProd": {
-      "Type": "AWS::Lambda::Permission",
-      "Properties": {
-        "Action": "lambda:InvokeFunction",
-        "Principal": "apigateway.amazonaws.com",
-        "FunctionName": {
-          "Ref": "MyFunctionWithAwsIamAuth"
-        },
-        "SourceArn": {
-          "Fn::Sub": [
-            "arn:aws-us-gov:execute-api:${AWS::Region}:${AWS::AccountId}:${__ApiId__}/${__Stage__}/POST/",
-            {
-              "__Stage__": "*",
-              "__ApiId__": {
-                "Ref": "MyApiWithAwsIamAuth"
-              }
-            }
-          ]
-        }
-      }
-    },
     "MyApiWithAwsIamAuth": {
-      "Type": "AWS::ApiGateway::RestApi",
       "Properties": {
         "Body": {
           "info": {
-            "version": "1.0",
             "title": {
               "Ref": "AWS::StackName"
-            }
+            },
+            "version": "1.0"
           },
           "paths": {
             "/": {
-              "post": {
-                "x-amazon-apigateway-integration": {
-                  "httpMethod": "POST",
-                  "type": "aws_proxy",
-                  "uri": {
-                    "Fn::Sub": "arn:aws-us-gov:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MyFunctionWithAwsIamAuth.Arn}/invocations"
-                  },
-                  "credentials": "arn:aws:iam::*:user/*"
-                },
-                "security": [
-                  {
-                    "AWS_IAM": []
-                  }
-                ],
-                "responses": {}
-              },
               "get": {
-                "x-amazon-apigateway-integration": {
-                  "httpMethod": "POST",
-                  "type": "aws_proxy",
-                  "uri": {
-                    "Fn::Sub": "arn:aws-us-gov:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MyFunctionWithAwsIamAuth.Arn}/invocations"
-                  }
-                },
+                "responses": {},
                 "security": [
                   {
                     "NONE": []
                   }
                 ],
-                "responses": {}
+                "x-amazon-apigateway-integration": {
+                  "httpMethod": "POST",
+                  "type": "aws_proxy",
+                  "uri": {
+                    "Fn::Sub": "arn:aws-us-gov:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MyFunctionWithAwsIamAuth.Arn}/invocations"
+                  }
+                }
+              },
+              "post": {
+                "responses": {},
+                "security": [
+                  {
+                    "AWS_IAM": []
+                  }
+                ],
+                "x-amazon-apigateway-integration": {
+                  "credentials": "arn:aws-us-gov:iam::*:user/*",
+                  "httpMethod": "POST",
+                  "type": "aws_proxy",
+                  "uri": {
+                    "Fn::Sub": "arn:aws-us-gov:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MyFunctionWithAwsIamAuth.Arn}/invocations"
+                  }
+                }
+              }
+            },
+            "/any/iam": {
+              "x-amazon-apigateway-any-method": {
+                "responses": {},
+                "security": [
+                  {
+                    "AWS_IAM": []
+                  }
+                ],
+                "x-amazon-apigateway-integration": {
+                  "credentials": "arn:aws-us-gov:iam::*:user/*",
+                  "httpMethod": "POST",
+                  "type": "aws_proxy",
+                  "uri": {
+                    "Fn::Sub": "arn:aws-us-gov:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MyFunctionWithAwsIamAuth.Arn}/invocations"
+                  }
+                }
+              }
+            },
+            "/any/none": {
+              "x-amazon-apigateway-any-method": {
+                "responses": {},
+                "security": [
+                  {
+                    "NONE": []
+                  }
+                ],
+                "x-amazon-apigateway-integration": {
+                  "httpMethod": "POST",
+                  "type": "aws_proxy",
+                  "uri": {
+                    "Fn::Sub": "arn:aws-us-gov:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MyFunctionWithAwsIamAuth.Arn}/invocations"
+                  }
+                }
               }
             }
           },
-          "swagger": "2.0",
           "securityDefinitions": {
             "AWS_IAM": {
               "in": "header",
-              "type": "apiKey",
               "name": "Authorization",
+              "type": "apiKey",
               "x-amazon-apigateway-authtype": "awsSigv4"
             }
-          }
+          },
+          "swagger": "2.0"
         },
         "EndpointConfiguration": {
           "Types": [
@@ -128,44 +97,141 @@
         "Parameters": {
           "endpointConfigurationTypes": "REGIONAL"
         }
-      }
+      },
+      "Type": "AWS::ApiGateway::RestApi"
+    },
+    "MyApiWithAwsIamAuthDeploymentdfc1685ec6": {
+      "Properties": {
+        "Description": "RestApi deployment id: dfc1685ec60c93f4367c419d58c209a36de689ad",
+        "RestApiId": {
+          "Ref": "MyApiWithAwsIamAuth"
+        },
+        "StageName": "Stage"
+      },
+      "Type": "AWS::ApiGateway::Deployment"
     },
     "MyApiWithAwsIamAuthProdStage": {
-      "Type": "AWS::ApiGateway::Stage",
       "Properties": {
         "DeploymentId": {
-          "Ref": "MyApiWithAwsIamAuthDeploymentce96ce9f89"
+          "Ref": "MyApiWithAwsIamAuthDeploymentdfc1685ec6"
         },
         "RestApiId": {
           "Ref": "MyApiWithAwsIamAuth"
         },
         "StageName": "Prod"
-      }
+      },
+      "Type": "AWS::ApiGateway::Stage"
     },
-    "MyApiWithAwsIamAuthDeploymentce96ce9f89": {
-      "Type": "AWS::ApiGateway::Deployment",
+    "MyFunctionWithAwsIamAuth": {
       "Properties": {
-        "RestApiId": {
-          "Ref": "MyApiWithAwsIamAuth"
+        "Code": {
+          "S3Bucket": "bucket",
+          "S3Key": "key"
         },
-        "Description": "RestApi deployment id: ce96ce9f89cd76c41cf8194b117ee9ae6a81e240",
-        "StageName": "Stage"
-      }
-    },
-    "MyFunctionWithAwsIamAuthRole": {
-      "Type": "AWS::IAM::Role",
-      "Properties": {
-        "ManagedPolicyArns": [
-          "arn:aws-us-gov:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-        ],
+        "Handler": "index.handler",
+        "Role": {
+          "Fn::GetAtt": [
+            "MyFunctionWithAwsIamAuthRole",
+            "Arn"
+          ]
+        },
+        "Runtime": "nodejs12.x",
         "Tags": [
           {
-            "Value": "SAM",
-            "Key": "lambda:createdBy"
+            "Key": "lambda:createdBy",
+            "Value": "SAM"
           }
-        ],
+        ]
+      },
+      "Type": "AWS::Lambda::Function"
+    },
+    "MyFunctionWithAwsIamAuthMyApiWithAwsIamAuthAnyMethodPermissionProd": {
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "MyFunctionWithAwsIamAuth"
+        },
+        "Principal": "apigateway.amazonaws.com",
+        "SourceArn": {
+          "Fn::Sub": [
+            "arn:aws-us-gov:execute-api:${AWS::Region}:${AWS::AccountId}:${__ApiId__}/${__Stage__}/*/any/iam",
+            {
+              "__ApiId__": {
+                "Ref": "MyApiWithAwsIamAuth"
+              },
+              "__Stage__": "*"
+            }
+          ]
+        }
+      },
+      "Type": "AWS::Lambda::Permission"
+    },
+    "MyFunctionWithAwsIamAuthMyApiWithAwsIamAuthPermissionProd": {
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "MyFunctionWithAwsIamAuth"
+        },
+        "Principal": "apigateway.amazonaws.com",
+        "SourceArn": {
+          "Fn::Sub": [
+            "arn:aws-us-gov:execute-api:${AWS::Region}:${AWS::AccountId}:${__ApiId__}/${__Stage__}/POST/",
+            {
+              "__ApiId__": {
+                "Ref": "MyApiWithAwsIamAuth"
+              },
+              "__Stage__": "*"
+            }
+          ]
+        }
+      },
+      "Type": "AWS::Lambda::Permission"
+    },
+    "MyFunctionWithAwsIamAuthMyApiWithNoAuthAnyMethodPermissionProd": {
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "MyFunctionWithAwsIamAuth"
+        },
+        "Principal": "apigateway.amazonaws.com",
+        "SourceArn": {
+          "Fn::Sub": [
+            "arn:aws-us-gov:execute-api:${AWS::Region}:${AWS::AccountId}:${__ApiId__}/${__Stage__}/*/any/none",
+            {
+              "__ApiId__": {
+                "Ref": "MyApiWithAwsIamAuth"
+              },
+              "__Stage__": "*"
+            }
+          ]
+        }
+      },
+      "Type": "AWS::Lambda::Permission"
+    },
+    "MyFunctionWithAwsIamAuthMyApiWithNoAuthPermissionProd": {
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "MyFunctionWithAwsIamAuth"
+        },
+        "Principal": "apigateway.amazonaws.com",
+        "SourceArn": {
+          "Fn::Sub": [
+            "arn:aws-us-gov:execute-api:${AWS::Region}:${AWS::AccountId}:${__ApiId__}/${__Stage__}/GET/",
+            {
+              "__ApiId__": {
+                "Ref": "MyApiWithAwsIamAuth"
+              },
+              "__Stage__": "*"
+            }
+          ]
+        }
+      },
+      "Type": "AWS::Lambda::Permission"
+    },
+    "MyFunctionWithAwsIamAuthRole": {
+      "Properties": {
         "AssumeRolePolicyDocument": {
-          "Version": "2012-10-17",
           "Statement": [
             {
               "Action": [
@@ -178,9 +244,20 @@
                 ]
               }
             }
-          ]
-        }
-      }
+          ],
+          "Version": "2012-10-17"
+        },
+        "ManagedPolicyArns": [
+          "arn:aws-us-gov:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        ],
+        "Tags": [
+          {
+            "Key": "lambda:createdBy",
+            "Value": "SAM"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Role"
     }
   }
 }

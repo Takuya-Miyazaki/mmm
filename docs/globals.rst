@@ -67,9 +67,14 @@ Currently, the following resources and properties are being supported:
       Layers:
       AutoPublishAlias:
       DeploymentPreference:
+      RolePath:
       PermissionsBoundary:
       ReservedConcurrentExecutions:
       EventInvokeConfig:
+      Architectures:
+      EphemeralStorage:
+      RuntimeManagementConfig:
+      LoggingConfig:
 
     Api:
       # Properties of AWS::Serverless::Api
@@ -77,6 +82,7 @@ Currently, the following resources and properties are being supported:
       Auth:
       Name:
       DefinitionUri:
+      MergeDefinitions:
       CacheClusterEnabled:
       CacheClusterSize:
       Variables:

@@ -1,8 +1,7 @@
-from mock import Mock
 from unittest import TestCase
+from unittest.mock import Mock
 
-from samtranslator.model import ResourceTypeResolver
-from samtranslator.model.exceptions import InvalidResourceException, InvalidEventException
+from samtranslator.model.exceptions import InvalidEventException, InvalidResourceException
 from samtranslator.model.stepfunctions import StateMachineGenerator
 from samtranslator.model.stepfunctions.events import CloudWatchEvent
 
@@ -29,7 +28,9 @@ class StepFunctionsStateMachine(TestCase):
             "event_resolver": None,
             "tags": None,
             "resource_attributes": None,
-            "passthrough_resource_attributes": None,
+            "passthrough_resource_attributes": {},
+            "auto_publish_alias": None,
+            "deployment_preference": None,
         }
 
     def test_state_machine_no_definition_source(self):
@@ -56,12 +57,8 @@ class StepFunctionsStateMachine(TestCase):
         self.kwargs["definition_uri"] = "s3://my-demo-bucket/my_asl_file.asl.json"
         self.kwargs["role"] = None
         self.kwargs["policies"] = None
-        with self.assertRaises(InvalidResourceException) as error:
-            StateMachineGenerator(**self.kwargs).to_cloudformation()
-        self.assertEqual(
-            error.exception.message,
-            "Resource with id [StateMachineId] is invalid. Either 'Role' or 'Policies' property must be specified.",
-        )
+        generated_resources = StateMachineGenerator(**self.kwargs).to_cloudformation()
+        self.assertEqual(generated_resources[1].resource_type, "AWS::IAM::Role")
 
     def test_state_machine_both_role_and_policies(self):
         self.kwargs["definition_uri"] = "s3://my-demo-bucket/my_asl_file.asl.json"
@@ -73,7 +70,8 @@ class StepFunctionsStateMachine(TestCase):
             StateMachineGenerator(**self.kwargs).to_cloudformation()
         self.assertEqual(
             error.exception.message,
-            "Resource with id [StateMachineId] is invalid. Specify either 'Role' or 'Policies' property and not both.",
+            "Resource with id [StateMachineId] is invalid. "
+            + StateMachineGenerator.SFN_INVALID_PROPERTY_BOTH_ROLE_POLICY,
         )
 
     def test_state_machine_invalid_definition_uri_string(self):
@@ -147,5 +145,76 @@ class StepFunctionsStateMachine(TestCase):
             }
         }
         self.kwargs["event_resources"] = {"KinesesEvent": {}}
-        with self.assertRaises(InvalidEventException) as error:
+        with self.assertRaises(InvalidEventException):
             StateMachineGenerator(**self.kwargs).to_cloudformation()
+
+    def test_state_machine_with_alias_as_event_source_target(self):
+        self.kwargs["definition_uri"] = "s3://mybucket/myASLfile"
+        self.kwargs["role"] = "my-test-role-arn"
+        self.kwargs["use_alias_as_event_target"] = True
+        self.kwargs["auto_publish_alias"] = "live"
+        event_resolver = Mock()
+        event_resolver.resolve_resource_type = Mock(return_value=CloudWatchEvent)
+        self.kwargs["event_resolver"] = event_resolver
+        self.kwargs["events"] = {
+            "CWEEvent": {"Type": "CloudWatchEvent", "Properties": {"Pattern": {"detail": {"state": ["terminated"]}}}}
+        }
+        self.kwargs["event_resources"] = {"CWEEvent": {}}
+        state_machine_generator = StateMachineGenerator(**self.kwargs)
+        state_machine_generator._generate_managed_traffic_shifting_resources()
+        generated_event_resources = state_machine_generator._generate_event_resources()
+        self.assertEqual(generated_event_resources[0].Targets[0]["Arn"], {"Ref": "StateMachineIdAliaslive"})
+
+    def test_state_machine_with_alias_as_event_source_target_requires_alias(self):
+        self.kwargs["definition_uri"] = "s3://mybucket/myASLfile"
+        self.kwargs["role"] = "my-test-role-arn"
+        self.kwargs["use_alias_as_event_target"] = True
+        self.kwargs["deployment_preference"] = {"Type": "ALL_AT_ONCE"}
+        # Missing property
+        # self.kwargs["auto_publish_alias"] = "live"
+        with self.assertRaises(InvalidResourceException) as error:
+            StateMachineGenerator(**self.kwargs).to_cloudformation()
+        self.assertEqual(
+            error.exception.message,
+            "Resource with id [StateMachineId] is invalid. 'UseAliasAsEventTarget' requires 'AutoPublishAlias' property to be specified.",
+        )
+
+    def test_state_machine_with_managed_traffic_shifting_properties(self):
+        self.kwargs["definition_uri"] = "s3://mybucket/myASLfile"
+        self.kwargs["role"] = "my-test-role-arn"
+        self.kwargs["auto_publish_alias"] = "live"
+        self.kwargs["deployment_preference"] = {"Type": "ALL_AT_ONCE"}
+        generated_managed_traffic_shifting_resources = StateMachineGenerator(
+            **self.kwargs
+        )._generate_managed_traffic_shifting_resources()
+        self.assertEqual(
+            generated_managed_traffic_shifting_resources[0].resource_type, "AWS::StepFunctions::StateMachineVersion"
+        )
+        self.assertEqual(
+            generated_managed_traffic_shifting_resources[1].resource_type, "AWS::StepFunctions::StateMachineAlias"
+        )
+
+    def test_state_machine_with_auto_publish_alias_and_no_deployment_preference(self):
+        self.kwargs["definition_uri"] = "s3://mybucket/myASLfile"
+        self.kwargs["role"] = "my-test-role-arn"
+        self.kwargs["auto_publish_alias"] = "live"
+        generated_managed_traffic_shifting_resources = StateMachineGenerator(
+            **self.kwargs
+        )._generate_managed_traffic_shifting_resources()
+        self.assertEqual(
+            generated_managed_traffic_shifting_resources[0].resource_type, "AWS::StepFunctions::StateMachineVersion"
+        )
+        self.assertEqual(
+            generated_managed_traffic_shifting_resources[1].resource_type, "AWS::StepFunctions::StateMachineAlias"
+        )
+
+    def test_state_machine_with_deployment_preference_and_no_auto_publish_alias(self):
+        self.kwargs["definition_uri"] = "s3://mybucket/myASLfile"
+        self.kwargs["role"] = "my-test-role-arn"
+        self.kwargs["deployment_preference"] = {"Type": "ALL_AT_ONCE"}
+        with self.assertRaises(InvalidResourceException) as error:
+            StateMachineGenerator(**self.kwargs).to_cloudformation()
+        self.assertEqual(
+            error.exception.message,
+            "Resource with id [StateMachineId] is invalid. 'DeploymentPreference' requires 'AutoPublishAlias' property to be specified.",
+        )

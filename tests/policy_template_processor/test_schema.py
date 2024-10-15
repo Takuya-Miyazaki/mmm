@@ -1,10 +1,10 @@
-from samtranslator.policy_template_processor.processor import PolicyTemplatesProcessor
-
-from parameterized import parameterized
 from unittest import TestCase
 
+from parameterized import parameterized
+from samtranslator.policy_template_processor.processor import PolicyTemplatesProcessor
 
-class TestTemplates(object):
+
+class TestTemplates:
     """
     Write your test cases here as different variables that store the entire template file. Start the variable with
     "succeed" if you want to test success case, "fail" if you want to test failure cases. The test runner will know
@@ -114,12 +114,10 @@ class TestPolicyTemplateSchema(TestCase):
     # Grab all variables of the class TestTemplates
     @parameterized.expand([d for d in dir(TestTemplates) if not d.startswith("__")])
     def test_schema(self, case):
-
         failure_case = case.startswith("fail")
         template = getattr(TestTemplates, case)
 
         if failure_case:
-
             with self.assertRaises(ValueError):
                 PolicyTemplatesProcessor._is_valid_templates_dict(template)
 

@@ -1,14 +1,14 @@
-import six
+from typing import Any, Dict, Optional, Type, cast
 
 from samtranslator.model.intrinsics import make_conditional
-from samtranslator.model.naming import GeneratedLogicalId
 from samtranslator.plugins.api.implicit_api_plugin import ImplicitApiPlugin
 from samtranslator.public.open_api import OpenApiEditor
-from samtranslator.public.exceptions import InvalidEventException
-from samtranslator.public.sdk.resource import SamResourceType, SamResource
+from samtranslator.public.sdk.resource import SamResource, SamResourceType
+from samtranslator.sdk.template import SamTemplate
+from samtranslator.validator.value_validator import sam_expect
 
 
-class ImplicitHttpApiPlugin(ImplicitApiPlugin):
+class ImplicitHttpApiPlugin(ImplicitApiPlugin[Type[OpenApiEditor]]):
     """
     This plugin provides Implicit Http API shorthand syntax in the SAM Spec.
 
@@ -26,24 +26,22 @@ class ImplicitHttpApiPlugin(ImplicitApiPlugin):
                                              in OpenApi. Does **not** configure the API by any means.
     """
 
-    def __init__(self):
-        """
-        Initializes the plugin
-        """
-        super(ImplicitHttpApiPlugin, self).__init__(ImplicitHttpApiPlugin.__name__)
+    API_ID_EVENT_PROPERTY = "ApiId"
+    IMPLICIT_API_LOGICAL_ID = "ServerlessHttpApi"
+    IMPLICIT_API_CONDITION = "ServerlessHttpApiCondition"
+    API_EVENT_TYPE = "HttpApi"
+    SERVERLESS_API_RESOURCE_TYPE = SamResourceType.HttpApi.value
+    EDITOR_CLASS = OpenApiEditor
 
-    def _setup_api_properties(self):
-        """
-        Sets up properties that are distinct to this plugin
-        """
-        self.implicit_api_logical_id = GeneratedLogicalId.implicit_http_api()
-        self.implicit_api_condition = "ServerlessHttpApiCondition"
-        self.api_event_type = "HttpApi"
-        self.api_type = SamResourceType.HttpApi.value
-        self.api_id_property = "ApiId"
-        self.editor = OpenApiEditor
-
-    def _process_api_events(self, function, api_events, template, condition=None):
+    def _process_api_events(  # noqa: PLR0913
+        self,
+        function: SamResource,
+        api_events: Dict[str, Dict[str, Any]],
+        template: SamTemplate,
+        condition: Optional[str] = None,
+        deletion_policy: Optional[str] = None,
+        update_replace_policy: Optional[str] = None,
+    ) -> None:
         """
         Actually process given HTTP API events. Iteratively adds the APIs to OpenApi JSON in the respective
         AWS::Serverless::HttpApi resource from the template
@@ -54,14 +52,18 @@ class ImplicitHttpApiPlugin(ImplicitApiPlugin):
         :param str condition: optional; this is the condition that is on the function with the API event
         """
 
-        for logicalId, event in api_events.items():
+        for event_id, event in api_events.items():
             # api_events only contains HttpApi events
             event_properties = event.get("Properties", {})
-            if not event_properties:
-                event["Properties"] = event_properties
-            self._add_implicit_api_id_if_necessary(event_properties)
 
-            api_id = self._get_api_id(event_properties)
+            sam_expect(event_properties, event_id, "", is_sam_event=True).to_be_a_map("Properties should be a map.")
+            if not event_properties:
+                event["Properties"] = event_properties  # We are updating its Properties
+
+            self._add_tags_to_implicit_api_if_necessary(event_properties, function, template)
+
+            self._add_implicit_api_id_if_necessary(event_properties)  # type: ignore[no-untyped-call]
+
             path = event_properties.get("Path", "")
             method = event_properties.get("Method", "")
             # If no path and method specified, add the $default path and ANY method
@@ -70,62 +72,35 @@ class ImplicitHttpApiPlugin(ImplicitApiPlugin):
                 method = "x-amazon-apigateway-any-method"
                 event_properties["Path"] = path
                 event_properties["Method"] = method
-            elif not path or not method:
-                key = "Path" if not path else "Method"
-                raise InvalidEventException(logicalId, "Event is missing key '{}'.".format(key))
 
-            if not isinstance(path, six.string_types) or not isinstance(method, six.string_types):
-                key = "Path" if not isinstance(path, six.string_types) else "Method"
-                raise InvalidEventException(logicalId, "Api Event must have a String specified for '{}'.".format(key))
+            api_id, path, method = self._validate_api_event(event_id, event_properties)
+            self._update_resource_attributes_from_api_event(
+                api_id, path, method, condition, deletion_policy, update_replace_policy
+            )
 
-            # !Ref is resolved by this time. If it is still a dict, we can't parse/use this Api.
-            if isinstance(api_id, dict):
-                raise InvalidEventException(logicalId, "Api Event must reference an Api in the same template.")
-
-            api_dict = self.api_conditions.setdefault(api_id, {})
-            method_conditions = api_dict.setdefault(path, {})
-
-            if condition:
-                method_conditions[method] = condition
-
-            self._add_api_to_swagger(logicalId, event_properties, template)
+            self._add_api_to_swagger(event_id, event_properties, template)  # type: ignore[no-untyped-call]
             if "RouteSettings" in event_properties:
-                self._add_route_settings_to_api(logicalId, event_properties, template, condition)
-            api_events[logicalId] = event
+                self._add_route_settings_to_api(event_id, event_properties, template, condition)
+            api_events[event_id] = event
 
         # We could have made changes to the Events structure. Write it back to function
         function.properties["Events"].update(api_events)
 
-    def _add_implicit_api_id_if_necessary(self, event_properties):
-        """
-        Events for implicit APIs will *not* have the RestApiId property. Absence of this property means this event
-        is associated with the AWS::Serverless::Api ImplicitAPI resource.
-        This method solidifies this assumption by adding RestApiId property to events that don't have them.
-
-        :param dict event_properties: Dictionary of event properties
-        """
-        if "ApiId" not in event_properties:
-            event_properties["ApiId"] = {"Ref": self.implicit_api_logical_id}
-
-    def _generate_implicit_api_resource(self):
+    def _generate_implicit_api_resource(self) -> Dict[str, Any]:
         """
         Uses the implicit API in this file to generate an Implicit API resource
         """
         return ImplicitHttpApiResource().to_dict()
 
-    def _get_api_definition_from_editor(self, editor):
+    def _get_api_definition_from_editor(self, editor: OpenApiEditor) -> Dict[str, Any]:
         """
         Helper function to return the OAS definition from the editor
         """
         return editor.openapi
 
-    def _get_api_resource_type_name(self):
-        """
-        Returns the type of API resource
-        """
-        return "AWS::Serverless::HttpApi"
-
-    def _add_route_settings_to_api(self, event_id, event_properties, template, condition):
+    def _add_route_settings_to_api(
+        self, event_id: str, event_properties: Dict[str, Any], template: SamTemplate, condition: Optional[str]
+    ) -> None:
         """
         Adds the RouteSettings for this path/method from the given event to the RouteSettings configuration
         on the AWS::Serverless::HttpApi that this refers to.
@@ -137,21 +112,23 @@ class ImplicitHttpApiPlugin(ImplicitApiPlugin):
         """
 
         api_id = self._get_api_id(event_properties)
-        resource = template.get(api_id)
+        resource = cast(SamResource, template.get(api_id))  # TODO: make this not an assumption
 
         path = event_properties["Path"]
         method = event_properties["Method"]
 
         # Route should be in format "METHOD /path" or just "/path" if the ANY method is used
-        route = "{} {}".format(method.upper(), path)
+        route = f"{method.upper()} {path}"
         if method == OpenApiEditor._X_ANY_METHOD:
             route = path
 
         # Handle Resource-level conditions if necessary
         api_route_settings = resource.properties.get("RouteSettings", {})
+        sam_expect(api_route_settings, api_id, "RouteSettings").to_be_a_map()
         event_route_settings = event_properties.get("RouteSettings", {})
         if condition:
             event_route_settings = make_conditional(condition, event_properties.get("RouteSettings", {}))
+        sam_expect(event_route_settings, event_id, "RouteSettings", is_sam_event=True).to_be_a_map()
 
         # Merge event-level and api-level RouteSettings properties
         api_route_settings.setdefault(route, {})
@@ -166,7 +143,7 @@ class ImplicitHttpApiResource(SamResource):
     includes the empty OpenApi along with default values for other properties.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         open_api = OpenApiEditor.gen_skeleton()
 
         resource = {
@@ -179,4 +156,4 @@ class ImplicitHttpApiResource(SamResource):
             },
         }
 
-        super(ImplicitHttpApiResource, self).__init__(resource)
+        super().__init__(resource)

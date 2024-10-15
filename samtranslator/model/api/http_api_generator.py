@@ -1,56 +1,62 @@
 import re
 from collections import namedtuple
-from six import string_types
-from samtranslator.model.intrinsics import ref, fnGetAtt
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
+
+from samtranslator.metrics.method_decorator import cw_timer
 from samtranslator.model.apigatewayv2 import (
-    ApiGatewayV2HttpApi,
-    ApiGatewayV2Stage,
+    ApiGatewayV2ApiMapping,
     ApiGatewayV2Authorizer,
     ApiGatewayV2DomainName,
-    ApiGatewayV2ApiMapping,
+    ApiGatewayV2HttpApi,
+    ApiGatewayV2Stage,
 )
 from samtranslator.model.exceptions import InvalidResourceException
+from samtranslator.model.intrinsics import fnGetAtt, fnSub, is_intrinsic, is_intrinsic_no_value, ref
+from samtranslator.model.lambda_ import LambdaPermission
+from samtranslator.model.route53 import Route53RecordSetGroup
 from samtranslator.model.s3_utils.uri_parser import parse_s3_uri
 from samtranslator.open_api.open_api import OpenApiEditor
-from samtranslator.translator import logical_id_generator
-from samtranslator.model.tags.resource_tagging import get_tag_list
-from samtranslator.model.intrinsics import is_intrinsic
-from samtranslator.model.route53 import Route53RecordSetGroup
+from samtranslator.translator.arn_generator import ArnGenerator
+from samtranslator.translator.logical_id_generator import LogicalIdGenerator
+from samtranslator.utils.types import Intrinsicable
+from samtranslator.utils.utils import InvalidValueType, dict_deep_get
+from samtranslator.validator.value_validator import sam_expect
 
 _CORS_WILDCARD = "*"
 CorsProperties = namedtuple(
-    "_CorsProperties", ["AllowMethods", "AllowHeaders", "AllowOrigins", "MaxAge", "ExposeHeaders", "AllowCredentials"]
+    "CorsProperties", ["AllowMethods", "AllowHeaders", "AllowOrigins", "MaxAge", "ExposeHeaders", "AllowCredentials"]
 )
 CorsProperties.__new__.__defaults__ = (None, None, None, None, None, False)
 
-AuthProperties = namedtuple("_AuthProperties", ["Authorizers", "DefaultAuthorizer"])
-AuthProperties.__new__.__defaults__ = (None, None)
+AuthProperties = namedtuple("AuthProperties", ["Authorizers", "DefaultAuthorizer", "EnableIamAuthorizer"])
+AuthProperties.__new__.__defaults__ = (None, None, False)
 DefaultStageName = "$default"
 HttpApiTagName = "httpapi:createdBy"
 
 
-class HttpApiGenerator(object):
-    def __init__(
+class HttpApiGenerator:
+    def __init__(  # noqa: PLR0913
         self,
-        logical_id,
-        stage_variables,
-        depends_on,
-        definition_body,
-        definition_uri,
-        stage_name,
-        tags=None,
-        auth=None,
-        cors_configuration=None,
-        access_log_settings=None,
-        route_settings=None,
-        default_route_settings=None,
-        resource_attributes=None,
-        passthrough_resource_attributes=None,
-        domain=None,
-        fail_on_warnings=False,
-        description=None,
-        disable_execute_api_endpoint=None,
-    ):
+        logical_id: str,
+        stage_variables: Optional[Dict[str, Intrinsicable[str]]],
+        depends_on: Optional[List[str]],
+        definition_body: Optional[Dict[str, Any]],
+        definition_uri: Optional[Intrinsicable[str]],
+        name: Optional[Any],
+        stage_name: Optional[Intrinsicable[str]],
+        tags: Optional[Dict[str, Intrinsicable[str]]] = None,
+        auth: Optional[Dict[str, Intrinsicable[str]]] = None,
+        cors_configuration: Optional[Union[bool, Dict[str, Any]]] = None,
+        access_log_settings: Optional[Dict[str, Intrinsicable[str]]] = None,
+        route_settings: Optional[Dict[str, Any]] = None,
+        default_route_settings: Optional[Dict[str, Any]] = None,
+        resource_attributes: Optional[Dict[str, Intrinsicable[str]]] = None,
+        passthrough_resource_attributes: Optional[Dict[str, Intrinsicable[str]]] = None,
+        domain: Optional[Dict[str, Any]] = None,
+        fail_on_warnings: Optional[Intrinsicable[bool]] = None,
+        description: Optional[Intrinsicable[str]] = None,
+        disable_execute_api_endpoint: Optional[Intrinsicable[bool]] = None,
+    ) -> None:
         """Constructs an API Generator class that generates API Gateway resources
 
         :param logical_id: Logical id of the SAM API Resource
@@ -72,6 +78,7 @@ class HttpApiGenerator(object):
         self.definition_body = definition_body
         self.definition_uri = definition_uri
         self.stage_name = stage_name
+        self.name = name
         if not self.stage_name:
             self.stage_name = DefaultStageName
         self.auth = auth
@@ -87,7 +94,7 @@ class HttpApiGenerator(object):
         self.description = description
         self.disable_execute_api_endpoint = disable_execute_api_endpoint
 
-    def _construct_http_api(self):
+    def _construct_http_api(self) -> ApiGatewayV2HttpApi:
         """Constructs and returns the ApiGatewayV2 HttpApi.
 
         :returns: the HttpApi to which this SAM Api corresponds
@@ -112,8 +119,12 @@ class HttpApiGenerator(object):
         if self.disable_execute_api_endpoint is not None:
             self._add_endpoint_configuration()
 
+        self._add_title()
+        self._add_description()
+        self._update_default_path()
+
         if self.definition_uri:
-            http_api.BodyS3Location = self._construct_body_s3_dict()
+            http_api.BodyS3Location = self._construct_body_s3_dict(self.definition_uri)
         elif self.definition_body:
             http_api.Body = self.definition_body
         else:
@@ -124,12 +135,9 @@ class HttpApiGenerator(object):
                 "add a 'HttpApi' event to an 'AWS::Serverless::Function'.",
             )
 
-        if self.description:
-            http_api.Description = self.description
-
         return http_api
 
-    def _add_endpoint_configuration(self):
+    def _add_endpoint_configuration(self) -> None:
         """Add disableExecuteApiEndpoint if it is set in SAM
         HttpApi doesn't have vpcEndpointIds
 
@@ -141,7 +149,7 @@ class HttpApiGenerator(object):
         For this reason, we always put DisableExecuteApiEndpoint into openapi object.
 
         """
-        if self.disable_execute_api_endpoint and not self.definition_body:
+        if self.disable_execute_api_endpoint is not None and not self.definition_body:
             raise InvalidResourceException(
                 self.logical_id, "DisableExecuteApiEndpoint works only within 'DefinitionBody' property."
             )
@@ -155,7 +163,7 @@ class HttpApiGenerator(object):
         # Assign the OpenApi back to template
         self.definition_body = editor.openapi
 
-    def _add_cors(self):
+    def _add_cors(self) -> None:
         """
         Add CORS configuration if CORSConfiguration property is set in SAM.
         Adds CORS configuration only if DefinitionBody is present and
@@ -171,16 +179,17 @@ class HttpApiGenerator(object):
         # This also support referencing the value as a parameter
         if isinstance(self.cors_configuration, bool):
             # if cors config is true add Origins as "'*'"
-            properties = CorsProperties(AllowOrigins=[_CORS_WILDCARD])
+            properties = CorsProperties(AllowOrigins=[_CORS_WILDCARD])  # type: ignore[call-arg]
 
         elif is_intrinsic(self.cors_configuration):
             # Just set Origin property. Intrinsics will be handledOthers will be defaults
-            properties = CorsProperties(AllowOrigins=self.cors_configuration)
+            properties = CorsProperties(AllowOrigins=self.cors_configuration)  # type: ignore[call-arg]
 
         elif isinstance(self.cors_configuration, dict):
             # Make sure keys in the dict are recognized
-            if not all(key in CorsProperties._fields for key in self.cors_configuration.keys()):
-                raise InvalidResourceException(self.logical_id, "Invalid value for 'Cors' property.")
+            for key in self.cors_configuration:
+                if key not in CorsProperties._fields:
+                    raise InvalidResourceException(self.logical_id, f"Invalid key '{key}' for 'Cors' property.")
 
             properties = CorsProperties(**self.cors_configuration)
 
@@ -206,7 +215,7 @@ class HttpApiGenerator(object):
         editor = OpenApiEditor(self.definition_body)
         # if CORS is set in both definition_body and as a CorsConfiguration property,
         # SAM merges and overrides the cors headers in definition_body with headers of CorsConfiguration
-        editor.add_cors(
+        editor.add_cors(  # type: ignore[no-untyped-call]
             properties.AllowOrigins,
             properties.AllowHeaders,
             properties.AllowMethods,
@@ -218,52 +227,79 @@ class HttpApiGenerator(object):
         # Assign the OpenApi back to template
         self.definition_body = editor.openapi
 
-    def _construct_api_domain(self, http_api):
+    def _update_default_path(self) -> None:
+        # Only do the following if FailOnWarnings is enabled for backward compatibility.
+        if not self.fail_on_warnings or not self.definition_body:
+            return
+
+        # Using default stage name generate warning during deployment
+        #   Warnings found during import: Parse issue: attribute paths.
+        #   Resource $default should start with / (Service: AmazonApiGatewayV2; Status Code: 400;
+        # Deployment fails when FailOnWarnings is true: https://github.com/aws/serverless-application-model/issues/2297
+        paths: Dict[str, Any] = self.definition_body.get("paths", {})
+        if DefaultStageName in paths:
+            paths[f"/{DefaultStageName}"] = paths.pop(DefaultStageName)
+
+    def _construct_api_domain(  # noqa: PLR0912, PLR0915
+        self, http_api: ApiGatewayV2HttpApi, route53_record_set_groups: Dict[str, Route53RecordSetGroup]
+    ) -> Tuple[
+        Optional[ApiGatewayV2DomainName],
+        Optional[List[ApiGatewayV2ApiMapping]],
+        Optional[Route53RecordSetGroup],
+    ]:
         """
         Constructs and returns the ApiGateway Domain and BasepathMapping
         """
         if self.domain is None:
             return None, None, None
 
-        if self.domain.get("DomainName") is None or self.domain.get("CertificateArn") is None:
+        custom_domain_config = self.domain  # not creating a copy as we will mutate it
+        domain_name = custom_domain_config.get("DomainName")
+
+        domain_name_config = {}
+
+        certificate_arn = custom_domain_config.get("CertificateArn")
+        if domain_name is None or certificate_arn is None:
             raise InvalidResourceException(
-                self.logical_id, "Custom Domains only works if both DomainName and CertificateArn" " are provided."
+                self.logical_id, "Custom Domains only works if both DomainName and CertificateArn are provided."
             )
+        domain_name_config["CertificateArn"] = certificate_arn
 
-        self.domain["ApiDomainName"] = "{}{}".format(
-            "ApiGatewayDomainNameV2", logical_id_generator.LogicalIdGenerator("", self.domain.get("DomainName")).gen()
-        )
+        api_domain_name = "{}{}".format("ApiGatewayDomainNameV2", LogicalIdGenerator("", domain_name).gen())
+        custom_domain_config["ApiDomainName"] = api_domain_name
 
-        domain = ApiGatewayV2DomainName(
-            self.domain.get("ApiDomainName"), attributes=self.passthrough_resource_attributes
-        )
-        domain_config = dict()
-        domain.DomainName = self.domain.get("DomainName")
+        domain = ApiGatewayV2DomainName(api_domain_name, attributes=self.passthrough_resource_attributes)
+        domain.DomainName = domain_name
         domain.Tags = self.tags
-        endpoint = self.domain.get("EndpointConfiguration")
 
-        if endpoint is None:
-            endpoint = "REGIONAL"
+        endpoint_config = custom_domain_config.get("EndpointConfiguration")
+        if endpoint_config is None:
+            endpoint_config = "REGIONAL"
             # to make sure that default is always REGIONAL
-            self.domain["EndpointConfiguration"] = "REGIONAL"
-        elif endpoint not in ["REGIONAL"]:
+            custom_domain_config["EndpointConfiguration"] = "REGIONAL"
+        elif endpoint_config not in ["REGIONAL"]:
             raise InvalidResourceException(
                 self.logical_id,
                 "EndpointConfiguration for Custom Domains must be one of {}.".format(["REGIONAL"]),
             )
-        domain_config["EndpointType"] = endpoint
-        domain_config["CertificateArn"] = self.domain.get("CertificateArn")
-        if self.domain.get("SecurityPolicy", None):
-            domain_config["SecurityPolicy"] = self.domain.get("SecurityPolicy")
+        domain_name_config["EndpointType"] = endpoint_config
 
-        domain.DomainNameConfigurations = [domain_config]
+        ownership_verification_certificate_arn = custom_domain_config.get("OwnershipVerificationCertificateArn")
+        if ownership_verification_certificate_arn:
+            domain_name_config["OwnershipVerificationCertificateArn"] = ownership_verification_certificate_arn
 
-        mutual_tls_auth = self.domain.get("MutualTlsAuthentication", None)
+        security_policy = custom_domain_config.get("SecurityPolicy")
+        if security_policy:
+            domain_name_config["SecurityPolicy"] = security_policy
+
+        domain.DomainNameConfigurations = [domain_name_config]
+
+        mutual_tls_auth = custom_domain_config.get("MutualTlsAuthentication", None)
         if mutual_tls_auth:
             if isinstance(mutual_tls_auth, dict):
                 if not set(mutual_tls_auth.keys()).issubset({"TruststoreUri", "TruststoreVersion"}):
                     invalid_keys = []
-                    for key in mutual_tls_auth.keys():
+                    for key in mutual_tls_auth:
                         if key not in {"TruststoreUri", "TruststoreVersion"}:
                             invalid_keys.append(key)
                     invalid_keys.sort()
@@ -280,57 +316,80 @@ class HttpApiGenerator(object):
                     domain.MutualTlsAuthentication["TruststoreVersion"] = mutual_tls_auth["TruststoreVersion"]
             else:
                 raise InvalidResourceException(
-                    mutual_tls_auth,
+                    self.logical_id,
                     "MutualTlsAuthentication must be a map with at least one of the following fields {}.".format(
                         ["TruststoreUri", "TruststoreVersion"]
                     ),
                 )
 
         # Create BasepathMappings
-        if self.domain.get("BasePath") and isinstance(self.domain.get("BasePath"), string_types):
-            basepaths = [self.domain.get("BasePath")]
-        elif self.domain.get("BasePath") and isinstance(self.domain.get("BasePath"), list):
-            basepaths = self.domain.get("BasePath")
+        basepaths: Optional[List[str]]
+        basepath_value = self.domain.get("BasePath")
+        if basepath_value and isinstance(basepath_value, str):
+            basepaths = [basepath_value]
+        elif basepath_value and isinstance(basepath_value, list):
+            basepaths = cast(Optional[List[str]], basepath_value)
         else:
             basepaths = None
-        basepath_resource_list = self._construct_basepath_mappings(basepaths, http_api)
+        basepath_resource_list = self._construct_basepath_mappings(basepaths, http_api, api_domain_name)
 
         # Create the Route53 RecordSetGroup resource
-        record_set_group = self._construct_route53_recordsetgroup()
+        record_set_group = self._construct_route53_recordsetgroup(
+            self.domain, route53_record_set_groups, api_domain_name
+        )
 
         return domain, basepath_resource_list, record_set_group
 
-    def _construct_route53_recordsetgroup(self):
-        record_set_group = None
-        if self.domain.get("Route53") is not None:
-            route53 = self.domain.get("Route53")
-            if route53.get("HostedZoneId") is None and route53.get("HostedZoneName") is None:
-                raise InvalidResourceException(
-                    self.logical_id,
-                    "HostedZoneId or HostedZoneName is required to enable Route53 support on Custom Domains.",
-                )
-            logical_id = logical_id_generator.LogicalIdGenerator(
-                "", route53.get("HostedZoneId") or route53.get("HostedZoneName")
-            ).gen()
-            record_set_group = Route53RecordSetGroup(
-                "RecordSetGroup" + logical_id, attributes=self.passthrough_resource_attributes
+    def _construct_route53_recordsetgroup(
+        self,
+        custom_domain_config: Dict[str, Any],
+        route53_record_set_groups: Dict[str, Route53RecordSetGroup],
+        api_domain_name: str,
+    ) -> Optional[Route53RecordSetGroup]:
+        route53_config = custom_domain_config.get("Route53")
+        if route53_config is None:
+            return None
+        sam_expect(route53_config, self.logical_id, "Domain.Route53").to_be_a_map()
+        if route53_config.get("HostedZoneId") is None and route53_config.get("HostedZoneName") is None:
+            raise InvalidResourceException(
+                self.logical_id,
+                "HostedZoneId or HostedZoneName is required to enable Route53 support on Custom Domains.",
             )
-            if "HostedZoneId" in route53:
-                record_set_group.HostedZoneId = route53.get("HostedZoneId")
-            elif "HostedZoneName" in route53:
-                record_set_group.HostedZoneName = route53.get("HostedZoneName")
-            record_set_group.RecordSets = self._construct_record_sets_for_domain(self.domain)
 
+        logical_id_suffix = LogicalIdGenerator(
+            "", route53_config.get("HostedZoneId") or route53_config.get("HostedZoneName")
+        ).gen()
+        logical_id = "RecordSetGroup" + logical_id_suffix
+
+        matching_record_set_group = route53_record_set_groups.get(logical_id)
+        if matching_record_set_group:
+            record_set_group = matching_record_set_group
+        else:
+            record_set_group = Route53RecordSetGroup(logical_id, attributes=self.passthrough_resource_attributes)
+            if "HostedZoneId" in route53_config:
+                record_set_group.HostedZoneId = route53_config.get("HostedZoneId")
+            elif "HostedZoneName" in route53_config:
+                record_set_group.HostedZoneName = route53_config.get("HostedZoneName")
+            record_set_group.RecordSets = []
+            route53_record_set_groups[logical_id] = record_set_group
+
+        if record_set_group.RecordSets is None:
+            record_set_group.RecordSets = []
+        record_set_group.RecordSets += self._construct_record_sets_for_domain(
+            custom_domain_config, route53_config, api_domain_name
+        )
         return record_set_group
 
-    def _construct_basepath_mappings(self, basepaths, http_api):
-        basepath_resource_list = []
+    def _construct_basepath_mappings(
+        self, basepaths: Optional[List[str]], http_api: ApiGatewayV2HttpApi, api_domain_name: str
+    ) -> List[ApiGatewayV2ApiMapping]:
+        basepath_resource_list: List[ApiGatewayV2ApiMapping] = []
 
         if basepaths is None:
             basepath_mapping = ApiGatewayV2ApiMapping(
                 self.logical_id + "ApiMapping", attributes=self.passthrough_resource_attributes
             )
-            basepath_mapping.DomainName = ref(self.domain.get("ApiDomainName"))
+            basepath_mapping.DomainName = ref(api_domain_name)
             basepath_mapping.ApiId = ref(http_api.logical_id)
             basepath_mapping.Stage = ref(http_api.logical_id + ".Stage")
             basepath_resource_list.extend([basepath_mapping])
@@ -338,56 +397,65 @@ class HttpApiGenerator(object):
             for path in basepaths:
                 # search for invalid characters in the path and raise error if there are
                 invalid_regex = r"[^0-9a-zA-Z\/\-\_]+"
+
+                if not isinstance(path, str):
+                    raise InvalidResourceException(self.logical_id, "Basepath must be a string.")
+
                 if re.search(invalid_regex, path) is not None:
                     raise InvalidResourceException(self.logical_id, "Invalid Basepath name provided.")
 
-                if path == "/":
-                    path = ""
-                else:
-                    # ignore leading and trailing `/` in the path name
-                    m = re.search(r"[a-zA-Z0-9]+[\-\_]?[a-zA-Z0-9]+", path)
-                    path = m.string[m.start(0) : m.end(0)]
-                    if path is None:
-                        raise InvalidResourceException(self.logical_id, "Invalid Basepath name provided.")
-
-                logical_id = "{}{}{}".format(self.logical_id, re.sub(r"[\-\_]+", "", path), "ApiMapping")
+                logical_id = "{}{}{}".format(self.logical_id, re.sub(r"[\-_/]+", "", path), "ApiMapping")
                 basepath_mapping = ApiGatewayV2ApiMapping(logical_id, attributes=self.passthrough_resource_attributes)
-                basepath_mapping.DomainName = ref(self.domain.get("ApiDomainName"))
+                basepath_mapping.DomainName = ref(api_domain_name)
                 basepath_mapping.ApiId = ref(http_api.logical_id)
                 basepath_mapping.Stage = ref(http_api.logical_id + ".Stage")
-                basepath_mapping.ApiMappingKey = path
+                # ignore leading and trailing `/` in the path name
+                basepath_mapping.ApiMappingKey = path.strip("/")
                 basepath_resource_list.extend([basepath_mapping])
         return basepath_resource_list
 
-    def _construct_record_sets_for_domain(self, domain):
+    def _construct_record_sets_for_domain(
+        self, custom_domain_config: Dict[str, Any], route53_config: Dict[str, Any], api_domain_name: str
+    ) -> List[Dict[str, Any]]:
         recordset_list = []
+
         recordset = {}
-        route53 = domain.get("Route53")
-
-        recordset["Name"] = domain.get("DomainName")
+        recordset["Name"] = custom_domain_config.get("DomainName")
         recordset["Type"] = "A"
-        recordset["AliasTarget"] = self._construct_alias_target(self.domain)
-        recordset_list.extend([recordset])
+        recordset["AliasTarget"] = self._construct_alias_target(custom_domain_config, route53_config, api_domain_name)
+        self._update_route53_routing_policy_properties(route53_config, recordset)
+        recordset_list.append(recordset)
 
-        recordset_ipv6 = {}
-        if route53.get("IpV6"):
-            recordset_ipv6["Name"] = domain.get("DomainName")
+        if route53_config.get("IpV6") is not None and route53_config.get("IpV6") is True:
+            recordset_ipv6 = {}
+            recordset_ipv6["Name"] = custom_domain_config.get("DomainName")
             recordset_ipv6["Type"] = "AAAA"
-            recordset_ipv6["AliasTarget"] = self._construct_alias_target(self.domain)
-            recordset_list.extend([recordset_ipv6])
+            recordset_ipv6["AliasTarget"] = self._construct_alias_target(
+                custom_domain_config, route53_config, api_domain_name
+            )
+            self._update_route53_routing_policy_properties(route53_config, recordset_ipv6)
+            recordset_list.append(recordset_ipv6)
 
         return recordset_list
 
-    def _construct_alias_target(self, domain):
+    @staticmethod
+    def _update_route53_routing_policy_properties(route53_config: Dict[str, Any], recordset: Dict[str, Any]) -> None:
+        if route53_config.get("Region") is not None:
+            recordset["Region"] = route53_config.get("Region")
+        if route53_config.get("SetIdentifier") is not None:
+            recordset["SetIdentifier"] = route53_config.get("SetIdentifier")
+
+    def _construct_alias_target(
+        self, domain_config: Dict[str, Any], route53_config: Dict[str, Any], api_domain_name: str
+    ) -> Dict[str, Any]:
         alias_target = {}
-        route53 = domain.get("Route53")
-        target_health = route53.get("EvaluateTargetHealth")
+        target_health = route53_config.get("EvaluateTargetHealth")
 
         if target_health is not None:
             alias_target["EvaluateTargetHealth"] = target_health
-        if domain.get("EndpointConfiguration") == "REGIONAL":
-            alias_target["HostedZoneId"] = fnGetAtt(self.domain.get("ApiDomainName"), "RegionalHostedZoneId")
-            alias_target["DNSName"] = fnGetAtt(self.domain.get("ApiDomainName"), "RegionalDomainName")
+        if domain_config.get("EndpointConfiguration") == "REGIONAL":
+            alias_target["HostedZoneId"] = fnGetAtt(api_domain_name, "RegionalHostedZoneId")
+            alias_target["DNSName"] = fnGetAtt(api_domain_name, "RegionalDomainName")
         else:
             raise InvalidResourceException(
                 self.logical_id,
@@ -395,7 +463,7 @@ class HttpApiGenerator(object):
             )
         return alias_target
 
-    def _add_auth(self):
+    def _add_auth(self) -> None:
         """
         Add Auth configuration to the OAS file, if necessary
         """
@@ -408,7 +476,7 @@ class HttpApiGenerator(object):
             )
 
         # Make sure keys in the dict are recognized
-        if not all(key in AuthProperties._fields for key in self.auth.keys()):
+        if not all(key in AuthProperties._fields for key in self.auth):
             raise InvalidResourceException(self.logical_id, "Invalid value for 'Auth' property")
 
         if not OpenApiEditor.is_valid(self.definition_body):
@@ -418,16 +486,14 @@ class HttpApiGenerator(object):
             )
         open_api_editor = OpenApiEditor(self.definition_body)
         auth_properties = AuthProperties(**self.auth)
-        authorizers = self._get_authorizers(auth_properties.Authorizers, auth_properties.DefaultAuthorizer)
+        authorizers = self._get_authorizers(auth_properties.Authorizers, auth_properties.EnableIamAuthorizer)
 
         # authorizers is guaranteed to return a value or raise an exception
         open_api_editor.add_authorizers_security_definitions(authorizers)
-        self._set_default_authorizer(
-            open_api_editor, authorizers, auth_properties.DefaultAuthorizer, auth_properties.Authorizers
-        )
+        self._set_default_authorizer(open_api_editor, authorizers, auth_properties.DefaultAuthorizer)
         self.definition_body = open_api_editor.openapi
 
-    def _add_tags(self):
+    def _add_tags(self) -> None:
         """
         Adds tags to the Http Api, including a default SAM tag.
         """
@@ -444,7 +510,7 @@ class HttpApiGenerator(object):
                 self.logical_id,
                 "Unable to add `Tags` because 'DefinitionBody' does not contain a valid OpenApi definition.",
             )
-        elif not OpenApiEditor.is_valid(self.definition_body):
+        if not OpenApiEditor.is_valid(self.definition_body):
             return
 
         if not self.tags:
@@ -457,7 +523,66 @@ class HttpApiGenerator(object):
         open_api_editor.add_tags(self.tags)
         self.definition_body = open_api_editor.openapi
 
-    def _set_default_authorizer(self, open_api_editor, authorizers, default_authorizer, api_authorizers):
+    def _get_permission(
+        self, authorizer_name: str, authorizer_lambda_function_arn: str, api_arn: str
+    ) -> LambdaPermission:
+        """Constructs and returns the Lambda Permission resource allowing the Authorizer to invoke the function.
+
+        :returns: the permission resource
+        :rtype: model.lambda_.LambdaPermission
+        """
+
+        resource = "${__ApiId__}/authorizers/*"
+        source_arn = fnSub(
+            ArnGenerator.generate_arn(partition="${AWS::Partition}", service="execute-api", resource=resource),
+            {"__ApiId__": api_arn},
+        )
+
+        lambda_permission = LambdaPermission(
+            self.logical_id + authorizer_name + "AuthorizerPermission", attributes=self.passthrough_resource_attributes
+        )
+        lambda_permission.Action = "lambda:InvokeFunction"
+        lambda_permission.FunctionName = authorizer_lambda_function_arn
+        lambda_permission.Principal = "apigateway.amazonaws.com"
+        lambda_permission.SourceArn = source_arn
+
+        return lambda_permission
+
+    def _construct_authorizer_lambda_permission(self, http_api: ApiGatewayV2HttpApi) -> List[LambdaPermission]:
+        if not self.auth:
+            return []
+
+        auth_properties = AuthProperties(**self.auth)
+        authorizers = self._get_authorizers(auth_properties.Authorizers, auth_properties.EnableIamAuthorizer)
+
+        if not authorizers:
+            return []
+
+        permissions: List[LambdaPermission] = []
+
+        for authorizer_name, authorizer in authorizers.items():
+            # Construct permissions for Lambda Authorizers only
+            # Http Api shouldn't create the permissions by default (when its none)
+            if (
+                not authorizer.function_arn
+                or authorizer.enable_function_default_permissions is None
+                or not authorizer.enable_function_default_permissions
+            ):
+                continue
+
+            permission = self._get_permission(
+                authorizer_name, authorizer.function_arn, http_api.get_runtime_attr("http_api_id")
+            )
+            permissions.append(permission)
+
+        return permissions
+
+    def _set_default_authorizer(
+        self,
+        open_api_editor: OpenApiEditor,
+        authorizers: Dict[str, ApiGatewayV2Authorizer],
+        default_authorizer: Optional[Any],
+    ) -> None:
         """
         Sets the default authorizer if one is given in the template
         :param open_api_editor: editor object that contains the OpenApi definition
@@ -468,6 +593,11 @@ class HttpApiGenerator(object):
         if not default_authorizer:
             return
 
+        if is_intrinsic_no_value(default_authorizer):
+            return
+
+        sam_expect(default_authorizer, self.logical_id, "Auth.DefaultAuthorizer").to_be_a_string()
+
         if not authorizers.get(default_authorizer):
             raise InvalidResourceException(
                 self.logical_id,
@@ -477,34 +607,36 @@ class HttpApiGenerator(object):
             )
 
         for path in open_api_editor.iter_on_path():
-            open_api_editor.set_path_default_authorizer(
-                path, default_authorizer, authorizers=authorizers, api_authorizers=api_authorizers
-            )
+            open_api_editor.set_path_default_authorizer(path, default_authorizer, authorizers)
 
-    def _get_authorizers(self, authorizers_config, default_authorizer=None):
+    def _get_authorizers(
+        self, authorizers_config: Any, enable_iam_authorizer: bool = False
+    ) -> Dict[str, ApiGatewayV2Authorizer]:
         """
         Returns all authorizers for an API as an ApiGatewayV2Authorizer object
         :param authorizers_config: authorizer configuration from the API Auth section
-        :param default_authorizer: name of the default authorizer
+        :param enable_iam_authorizer: if True add an "AWS_IAM" authorizer
         """
-        authorizers = {}
+        authorizers: Dict[str, ApiGatewayV2Authorizer] = {}
 
-        if not isinstance(authorizers_config, dict):
-            raise InvalidResourceException(self.logical_id, "Authorizers must be a dictionary.")
+        if enable_iam_authorizer is True:
+            authorizers["AWS_IAM"] = ApiGatewayV2Authorizer(is_aws_iam_authorizer=True)  # type: ignore[no-untyped-call]
+
+        # If all the customer wants to do is enable the IAM authorizer the authorizers_config will be None.
+        if not authorizers_config:
+            return authorizers
+
+        sam_expect(authorizers_config, self.logical_id, "Auth.Authorizers").to_be_a_map()
 
         for authorizer_name, authorizer in authorizers_config.items():
-            if not isinstance(authorizer, dict):
-                raise InvalidResourceException(
-                    self.logical_id, "Authorizer %s must be a dictionary." % (authorizer_name)
-                )
+            sam_expect(authorizer, self.logical_id, f"Auth.Authorizers.{authorizer_name}").to_be_a_map()
 
             if "OpenIdConnectUrl" in authorizer:
                 raise InvalidResourceException(
                     self.logical_id,
-                    "'OpenIdConnectUrl' is no longer a supported property for authorizer '%s'. Please refer to the AWS SAM documentation."
-                    % (authorizer_name),
+                    f"'OpenIdConnectUrl' is no longer a supported property for authorizer '{authorizer_name}'. Please refer to the AWS SAM documentation.",
                 )
-            authorizers[authorizer_name] = ApiGatewayV2Authorizer(
+            authorizers[authorizer_name] = ApiGatewayV2Authorizer(  # type: ignore[no-untyped-call]
                 api_logical_id=self.logical_id,
                 name=authorizer_name,
                 authorization_scopes=authorizer.get("AuthorizationScopes"),
@@ -515,39 +647,41 @@ class HttpApiGenerator(object):
                 identity=authorizer.get("Identity"),
                 authorizer_payload_format_version=authorizer.get("AuthorizerPayloadFormatVersion"),
                 enable_simple_responses=authorizer.get("EnableSimpleResponses"),
+                enable_function_default_permissions=authorizer.get("EnableFunctionDefaultPermissions"),
             )
         return authorizers
 
-    def _construct_body_s3_dict(self):
+    def _construct_body_s3_dict(self, definition_url: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
         """
         Constructs the HttpApi's `BodyS3Location property`, from the SAM Api's DefinitionUri property.
         :returns: a BodyS3Location dict, containing the S3 Bucket, Key, and Version of the OpenApi definition
         :rtype: dict
         """
-        if isinstance(self.definition_uri, dict):
-            if not self.definition_uri.get("Bucket", None) or not self.definition_uri.get("Key", None):
+        if isinstance(definition_url, dict):
+            if not definition_url.get("Bucket", None) or not definition_url.get("Key", None):
                 # DefinitionUri is a dictionary but does not contain Bucket or Key property
                 raise InvalidResourceException(
                     self.logical_id, "'DefinitionUri' requires Bucket and Key properties to be specified."
                 )
-            s3_pointer = self.definition_uri
+            s3_pointer = definition_url
 
         else:
             # DefinitionUri is a string
-            s3_pointer = parse_s3_uri(self.definition_uri)
-            if s3_pointer is None:
+            _parsed_s3_pointer = parse_s3_uri(definition_url)
+            if _parsed_s3_pointer is None:
                 raise InvalidResourceException(
                     self.logical_id,
                     "'DefinitionUri' is not a valid S3 Uri of the form "
                     "'s3://bucket/key' with optional versionId query parameter.",
                 )
+            s3_pointer = _parsed_s3_pointer
 
         body_s3 = {"Bucket": s3_pointer["Bucket"], "Key": s3_pointer["Key"]}
         if "Version" in s3_pointer:
             body_s3["Version"] = s3_pointer["Version"]
         return body_s3
 
-    def _construct_stage(self):
+    def _construct_stage(self) -> Optional[ApiGatewayV2Stage]:
         """Constructs and returns the ApiGatewayV2 Stage.
 
         :returns: the Stage to which this SAM Api corresponds
@@ -562,17 +696,17 @@ class HttpApiGenerator(object):
             and not self.default_route_settings
             and not self.route_settings
         ):
-            return
+            return None
 
         # If StageName is some intrinsic function, then don't prefix the Stage's logical ID
         # This will NOT create duplicates because we allow only ONE stage per API resource
-        stage_name_prefix = self.stage_name if isinstance(self.stage_name, string_types) else ""
+        stage_name_prefix = self.stage_name if isinstance(self.stage_name, str) else ""
         if stage_name_prefix.isalnum():
             stage_logical_id = self.logical_id + stage_name_prefix + "Stage"
         elif stage_name_prefix == DefaultStageName:
             stage_logical_id = self.logical_id + "ApiGatewayDefaultStage"
         else:
-            generator = logical_id_generator.LogicalIdGenerator(self.logical_id + "Stage", stage_name_prefix)
+            generator = LogicalIdGenerator(self.logical_id + "Stage", stage_name_prefix)
             stage_logical_id = generator.gen()
         stage = ApiGatewayV2Stage(stage_logical_id, attributes=self.passthrough_resource_attributes)
         stage.ApiId = ref(self.logical_id)
@@ -586,14 +720,79 @@ class HttpApiGenerator(object):
 
         return stage
 
-    def to_cloudformation(self):
+    def _add_description(self) -> None:
+        """Add description to DefinitionBody if Description property is set in SAM"""
+        if not self.description:
+            return
+
+        if not self.definition_body:
+            raise InvalidResourceException(
+                self.logical_id,
+                "Description works only with inline OpenApi specified in the 'DefinitionBody' property.",
+            )
+        try:
+            description_in_definition_body = dict_deep_get(self.definition_body, "info.description")
+        except InvalidValueType as ex:
+            raise InvalidResourceException(
+                self.logical_id,
+                f"Invalid 'DefinitionBody': {ex!s}'.",
+            ) from ex
+        if description_in_definition_body:
+            raise InvalidResourceException(
+                self.logical_id,
+                "Unable to set Description because it is already defined within inline OpenAPI specified in the "
+                "'DefinitionBody' property.",
+            )
+
+        open_api_editor = OpenApiEditor(self.definition_body)
+        open_api_editor.add_description(self.description)
+        self.definition_body = open_api_editor.openapi
+
+    def _add_title(self) -> None:
+        if not self.name:
+            return
+
+        if not self.definition_body:
+            raise InvalidResourceException(
+                self.logical_id,
+                "Name works only with inline OpenApi specified in the 'DefinitionBody' property.",
+            )
+
+        try:
+            title_in_definition_body = dict_deep_get(self.definition_body, "info.title")
+        except InvalidValueType as ex:
+            raise InvalidResourceException(
+                self.logical_id,
+                f"Invalid 'DefinitionBody': {ex!s}.",
+            ) from ex
+        if title_in_definition_body != OpenApiEditor._DEFAULT_OPENAPI_TITLE:
+            raise InvalidResourceException(
+                self.logical_id,
+                "Unable to set Name because it is already defined within inline OpenAPI specified in the "
+                "'DefinitionBody' property.",
+            )
+
+        open_api_editor = OpenApiEditor(self.definition_body)
+        open_api_editor.add_title(self.name)
+        self.definition_body = open_api_editor.openapi
+
+    @cw_timer(prefix="Generator", name="HttpApi")
+    def to_cloudformation(self, route53_record_set_groups: Dict[str, Route53RecordSetGroup]) -> Tuple[
+        ApiGatewayV2HttpApi,
+        Optional[ApiGatewayV2Stage],
+        Optional[ApiGatewayV2DomainName],
+        Optional[List[ApiGatewayV2ApiMapping]],
+        Optional[Route53RecordSetGroup],
+        Optional[List[LambdaPermission]],
+    ]:
         """Generates CloudFormation resources from a SAM HTTP API resource
 
         :returns: a tuple containing the HttpApi and Stage for an empty Api.
         :rtype: tuple
         """
         http_api = self._construct_http_api()
-        domain, basepath_mapping, route53 = self._construct_api_domain(http_api)
+        domain, basepath_mapping, route53 = self._construct_api_domain(http_api, route53_record_set_groups)
+        permissions = self._construct_authorizer_lambda_permission(http_api)
         stage = self._construct_stage()
 
-        return http_api, stage, domain, basepath_mapping, route53
+        return http_api, stage, domain, basepath_mapping, route53, permissions

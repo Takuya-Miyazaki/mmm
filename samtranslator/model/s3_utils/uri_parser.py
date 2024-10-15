@@ -1,15 +1,17 @@
-from six import string_types
-from six.moves.urllib.parse import urlparse, parse_qs
+from re import search
+from typing import Any, Dict, Optional, Union
+from urllib.parse import parse_qs, urlparse
+
 from samtranslator.model.exceptions import InvalidResourceException
 
 
-def parse_s3_uri(uri):
+def parse_s3_uri(uri: Any) -> Optional[Dict[str, Any]]:
     """Parses a S3 Uri into a dictionary of the Bucket, Key, and VersionId
 
     :return: a BodyS3Location dict or None if not an S3 Uri
     :rtype: dict
     """
-    if not isinstance(uri, string_types):
+    if not isinstance(uri, str):
         return None
 
     url = urlparse(uri)
@@ -20,11 +22,10 @@ def parse_s3_uri(uri):
         if "versionId" in query and len(query["versionId"]) == 1:
             s3_pointer["Version"] = query["versionId"][0]
         return s3_pointer
-    else:
-        return None
+    return None
 
 
-def to_s3_uri(code_dict):
+def to_s3_uri(code_dict):  # type: ignore[no-untyped-def]
     """Constructs a S3 URI string from given code dictionary
 
     :param dict code_dict: Dictionary containing Lambda function Code S3 location of the form
@@ -36,8 +37,8 @@ def to_s3_uri(code_dict):
     try:
         uri = "s3://{bucket}/{key}".format(bucket=code_dict["S3Bucket"], key=code_dict["S3Key"])
         version = code_dict.get("S3ObjectVersion", None)
-    except (TypeError, AttributeError):
-        raise TypeError("Code location should be a dictionary")
+    except (TypeError, AttributeError) as ex:
+        raise TypeError("Code location should be a dictionary") from ex
 
     if version:
         uri += "?versionId=" + version
@@ -45,7 +46,7 @@ def to_s3_uri(code_dict):
     return uri
 
 
-def construct_image_code_object(image_uri, logical_id, property_name):
+def construct_image_code_object(image_uri, logical_id, property_name):  # type: ignore[no-untyped-def]
     """Constructs a Lambda `Code` or `Content` property, from the SAM `ImageUri` property.
     This follows the current scheme for Lambda Functions.
 
@@ -57,13 +58,15 @@ def construct_image_code_object(image_uri, logical_id, property_name):
     """
     if not image_uri:
         raise InvalidResourceException(
-            logical_id, "'{}' requires that a image hosted at a registry be specified.".format(property_name)
+            logical_id, f"'{property_name}' requires that a image hosted at a registry be specified."
         )
 
     return {"ImageUri": image_uri}
 
 
-def construct_s3_location_object(location_uri, logical_id, property_name):
+def construct_s3_location_object(
+    location_uri: Union[str, Dict[str, Any]], logical_id: str, property_name: str
+) -> Dict[str, Any]:
     """Constructs a Lambda `Code` or `Content` property, from the SAM `CodeUri` or `ContentUri` property.
     This follows the current scheme for Lambda Functions and LayerVersions.
 
@@ -77,22 +80,35 @@ def construct_s3_location_object(location_uri, logical_id, property_name):
         if not location_uri.get("Bucket") or not location_uri.get("Key"):
             # location_uri is a dictionary but does not contain Bucket or Key property
             raise InvalidResourceException(
-                logical_id, "'{}' requires Bucket and Key properties to be specified.".format(property_name)
+                logical_id, f"'{property_name}' requires Bucket and Key properties to be specified."
             )
 
         s3_pointer = location_uri
 
-    else:
-        # location_uri is NOT a dictionary. Parse it as a string
-        s3_pointer = parse_s3_uri(location_uri)
-
-        if s3_pointer is None:
+    elif isinstance(location_uri, str):
+        # SSM Pattern found here https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/dynamic-references.html
+        ssm_pattern = r"{{resolve:(ssm|ssm-secure|secretsmanager):[a-zA-Z0-9_.\-/]+(:\d+)?}}"
+        match = search(ssm_pattern, location_uri)
+        if match and match.group(0) and "/" in match.group(0):
             raise InvalidResourceException(
                 logical_id,
-                "'{}' is not a valid S3 Uri of the form "
-                "'s3://bucket/key' with optional versionId query "
-                "parameter.".format(property_name),
+                f"Unsupported dynamic reference detected in '{property_name}'. Please "
+                "consider using alternative 'FunctionCode' object format.",
             )
+
+        # location_uri is NOT a dictionary. Parse it as a string
+        _s3_pointer = parse_s3_uri(location_uri)
+
+        if _s3_pointer is None:
+            raise InvalidResourceException(
+                logical_id,
+                f"'{property_name}' is not a valid S3 Uri of the form "
+                "'s3://bucket/key' with optional versionId query "
+                "parameter.",
+            )
+        s3_pointer = _s3_pointer
+    else:
+        raise InvalidResourceException(logical_id, f"'{property_name}' must be of type dict or string.")
 
     code = {"S3Bucket": s3_pointer["Bucket"], "S3Key": s3_pointer["Key"]}
     if "Version" in s3_pointer:

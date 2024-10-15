@@ -1,10 +1,13 @@
-﻿from samtranslator.public.sdk.resource import SamResourceType
+import copy
+from typing import Any, Dict, List, Optional, Union
+
+from samtranslator.model.exceptions import ExceptionWithMessage, InvalidResourceAttributeTypeException
 from samtranslator.public.intrinsics import is_intrinsics
+from samtranslator.public.sdk.resource import SamResourceType
 from samtranslator.swagger.swagger import SwaggerEditor
-from six import string_types
 
 
-class Globals(object):
+class Globals:
     """
     Class to parse and process Globals section in SAM template. If a property is specified at Global section for
     say Function, then this class will add it to each resource of AWS::Serverless::Function type.
@@ -30,11 +33,14 @@ class Globals(object):
             "VpcConfig",
             "Environment",
             "Tags",
+            "PropagateTags",
             "Tracing",
             "KmsKeyArn",
             "AutoPublishAlias",
+            "AutoPublishAliasAllProperties",
             "Layers",
             "DeploymentPreference",
+            "RolePath",
             "PermissionsBoundary",
             "ReservedConcurrentExecutions",
             "ProvisionedConcurrencyConfig",
@@ -42,6 +48,13 @@ class Globals(object):
             "EventInvokeConfig",
             "FileSystemConfigs",
             "CodeSigningConfigArn",
+            "Architectures",
+            "SnapStart",
+            "EphemeralStorage",
+            "FunctionUrlConfig",
+            "RuntimeManagementConfig",
+            "LoggingConfig",
+            "RecursiveLoop",
         ],
         # Everything except
         #   DefinitionBody: because its hard to reason about merge of Swagger dictionaries
@@ -53,6 +66,7 @@ class Globals(object):
             "DefinitionUri",
             "CacheClusterEnabled",
             "CacheClusterSize",
+            "MergeDefinitions",
             "Variables",
             "EndpointConfiguration",
             "MethodSettings",
@@ -65,6 +79,8 @@ class Globals(object):
             "TracingEnabled",
             "OpenApiVersion",
             "Domain",
+            "AlwaysDeploy",
+            "PropagateTags",
         ],
         SamResourceType.HttpApi.value: [
             "Auth",
@@ -76,28 +92,79 @@ class Globals(object):
             "Domain",
             "RouteSettings",
             "FailOnWarnings",
+            "PropagateTags",
         ],
         SamResourceType.SimpleTable.value: ["SSESpecification"],
+        SamResourceType.StateMachine.value: ["PropagateTags"],
+    }
+    # unreleased_properties *must be* part of supported_properties too
+    unreleased_properties: Dict[str, List[str]] = {
+        SamResourceType.Function.value: ["RuntimeManagementConfig", "RecursiveLoop"],
     }
 
-    def __init__(self, template):
+    def __init__(self, template: Dict[str, Any]) -> None:
         """
         Constructs an instance of this object
 
         :param dict template: SAM template to be parsed
         """
         self.supported_resource_section_names = [
-            x.replace(self._RESOURCE_PREFIX, "") for x in self.supported_properties.keys()
+            x.replace(self._RESOURCE_PREFIX, "") for x in self.supported_properties
         ]
         # Sort the names for stability in list ordering
         self.supported_resource_section_names.sort()
 
-        self.template_globals = {}
+        self.template_globals: Dict[str, GlobalProperties] = {}
 
         if self._KEYWORD in template:
-            self.template_globals = self._parse(template[self._KEYWORD])
+            self.template_globals = self._parse(template[self._KEYWORD])  # type: ignore[no-untyped-call]
 
-    def merge(self, resource_type, resource_properties):
+    def get_template_globals(
+        self, logical_id: str, resource_type: str, ignore_globals: Optional[Union[str, List[str]]]
+    ) -> "GlobalProperties":
+        """
+        Get template globals but remove globals based on IgnoreGlobals attribute.
+
+        :param string logical_id: LogicalId of the resource
+        :param string resource_type: Type of the resource (Ex: AWS::Serverless::Function)
+        :param dict ignore_globals: IgnoreGlobals resource attribute. It can be either 1) "*" string value
+            or list of string value, each value should be a valid property in Globals section
+        :return dict: processed template globals
+        """
+        if not ignore_globals:
+            return self.template_globals[resource_type]
+
+        if isinstance(ignore_globals, str) and ignore_globals == "*":
+            return GlobalProperties({})
+
+        if isinstance(ignore_globals, list):
+            global_props: GlobalProperties = copy.deepcopy(self.template_globals[resource_type])
+            for key in ignore_globals:
+                if key not in global_props.global_properties:
+                    raise InvalidResourceAttributeTypeException(
+                        logical_id,
+                        "IgnoreGlobals",
+                        None,
+                        f"Resource {logical_id} has invalid resource attribute 'IgnoreGlobals' on item '{key}'.",
+                    )
+                del global_props.global_properties[key]
+            return global_props
+
+        # We raise exception for any non "*" or non-list input
+        raise InvalidResourceAttributeTypeException(
+            logical_id,
+            "IgnoreGlobals",
+            None,
+            f"Resource {logical_id} has invalid resource attribute 'IgnoreGlobals'.",
+        )
+
+    def merge(
+        self,
+        resource_type: str,
+        resource_properties: Dict[str, Any],
+        logical_id: str = "",
+        ignore_globals: Optional[Union[str, List[str]]] = None,
+    ) -> Any:
         """
         Adds global properties to the resource, if necessary. This method is a no-op if there are no global properties
         for this resource type
@@ -111,12 +178,12 @@ class Globals(object):
             # Nothing to do. Return the template unmodified
             return resource_properties
 
-        global_props = self.template_globals[resource_type]
+        global_props = self.get_template_globals(logical_id, str(resource_type), ignore_globals)
 
-        return global_props.merge(resource_properties)
+        return global_props.merge(resource_properties)  # type: ignore[no-untyped-call]
 
     @classmethod
-    def del_section(cls, template):
+    def del_section(cls, template: Dict[str, Any]) -> None:
         """
         Helper method to delete the Globals section altogether from the template
 
@@ -128,7 +195,7 @@ class Globals(object):
             del template[cls._KEYWORD]
 
     @classmethod
-    def fix_openapi_definitions(cls, template):
+    def fix_openapi_definitions(cls, template: Dict[str, Any]) -> None:
         """
         Helper method to postprocess the resources to make sure the swagger doc version matches
         the one specified on the resource with flag OpenApiVersion.
@@ -141,7 +208,6 @@ class Globals(object):
         To make sure we don't modify customer defined swagger, we also check for __MANAGE_SWAGGER flag.
 
         :param dict template: SAM template
-        :return: Modified SAM template with corrected swagger doc matching the OpenApiVersion.
         """
         resources = template.get("Resources", {})
 
@@ -152,10 +218,10 @@ class Globals(object):
                     (cls._OPENAPIVERSION in properties)
                     and (cls._MANAGE_SWAGGER in properties)
                     and SwaggerEditor.safe_compare_regex_with_string(
-                        SwaggerEditor.get_openapi_version_3_regex(), properties[cls._OPENAPIVERSION]
+                        SwaggerEditor._OPENAPI_VERSION_3_REGEX, properties[cls._OPENAPIVERSION]
                     )
                 ):
-                    if not isinstance(properties[cls._OPENAPIVERSION], string_types):
+                    if not isinstance(properties[cls._OPENAPIVERSION], str):
                         properties[cls._OPENAPIVERSION] = str(properties[cls._OPENAPIVERSION])
                         resource["Properties"] = properties
                     if "DefinitionBody" in properties:
@@ -164,7 +230,7 @@ class Globals(object):
                         if definition_body.get("swagger"):
                             del definition_body["swagger"]
 
-    def _parse(self, globals_dict):
+    def _parse(self, globals_dict):  # type: ignore[no-untyped-def]
         """
         Takes a SAM template as input and parses the Globals section
 
@@ -173,48 +239,45 @@ class Globals(object):
         :raises: InvalidResourceException if the input contains properties that we don't support
         """
 
-        globals = {}
+        _globals = {}
         if not isinstance(globals_dict, dict):
-            raise InvalidGlobalsSectionException(
-                self._KEYWORD, "It must be a non-empty dictionary".format(self._KEYWORD)
-            )
+            raise InvalidGlobalsSectionException(self._KEYWORD, "It must be a non-empty dictionary")
 
         for section_name, properties in globals_dict.items():
-            resource_type = self._make_resource_type(section_name)
+            resource_type = self._make_resource_type(section_name)  # type: ignore[no-untyped-call]
 
             if resource_type not in self.supported_properties:
                 raise InvalidGlobalsSectionException(
                     self._KEYWORD,
-                    "'{section}' is not supported. "
-                    "Must be one of the following values - {supported}".format(
-                        section=section_name, supported=self.supported_resource_section_names
-                    ),
+                    f"'{section_name}' is not supported. "
+                    f"Must be one of the following values - {self.supported_resource_section_names}",
                 )
 
             if not isinstance(properties, dict):
                 raise InvalidGlobalsSectionException(self._KEYWORD, "Value of ${section} must be a dictionary")
 
-            for key, value in properties.items():
-                supported = self.supported_properties[resource_type]
+            supported = self.supported_properties[resource_type]
+            supported_displayed = [
+                prop for prop in supported if prop not in self.unreleased_properties.get(resource_type, [])
+            ]
+            for key, _ in properties.items():
                 if key not in supported:
                     raise InvalidGlobalsSectionException(
                         self._KEYWORD,
-                        "'{key}' is not a supported property of '{section}'. "
-                        "Must be one of the following values - {supported}".format(
-                            key=key, section=section_name, supported=supported
-                        ),
+                        f"'{key}' is not a supported property of '{section_name}'. "
+                        f"Must be one of the following values - {supported_displayed}",
                     )
 
             # Store all Global properties in a map with key being the AWS::Serverless::* resource type
-            globals[resource_type] = GlobalProperties(properties)
+            _globals[resource_type] = GlobalProperties(properties)
 
-        return globals
+        return _globals
 
-    def _make_resource_type(self, key):
+    def _make_resource_type(self, key):  # type: ignore[no-untyped-def]
         return self._RESOURCE_PREFIX + key
 
 
-class GlobalProperties(object):
+class GlobalProperties:
     """
     Object holding the global properties of given type. It also contains methods to perform a merge between
     Global & resource-level properties. Here are the different cases during the merge and how we handle them:
@@ -334,18 +397,18 @@ class GlobalProperties(object):
 
     """
 
-    def __init__(self, global_properties):
+    def __init__(self, global_properties) -> None:  # type: ignore[no-untyped-def]
         self.global_properties = global_properties
 
-    def merge(self, local_properties):
+    def merge(self, local_properties):  # type: ignore[no-untyped-def]
         """
         Merge Global & local level properties according to the above rules
 
         :return local_properties: Dictionary of local properties
         """
-        return self._do_merge(self.global_properties, local_properties)
+        return self._do_merge(self.global_properties, local_properties)  # type: ignore[no-untyped-call]
 
-    def _do_merge(self, global_value, local_value):
+    def _do_merge(self, global_value, local_value):  # type: ignore[no-untyped-def]
         """
         Actually perform the merge operation for the given inputs. This method is used as part of the recursion.
         Therefore input values can be of any type. So is the output.
@@ -360,23 +423,20 @@ class GlobalProperties(object):
 
         # The following statements codify the rules explained in the doctring above
         if token_global != token_local:
-            return self._prefer_local(global_value, local_value)
+            return self._prefer_local(global_value, local_value)  # type: ignore[no-untyped-call]
 
-        elif self.TOKEN.PRIMITIVE == token_global == token_local:
-            return self._prefer_local(global_value, local_value)
+        if self.TOKEN.PRIMITIVE == token_global == token_local:
+            return self._prefer_local(global_value, local_value)  # type: ignore[no-untyped-call]
 
-        elif self.TOKEN.DICT == token_global == token_local:
-            return self._merge_dict(global_value, local_value)
+        if self.TOKEN.DICT == token_global == token_local:
+            return self._merge_dict(global_value, local_value)  # type: ignore[no-untyped-call]
 
-        elif self.TOKEN.LIST == token_global == token_local:
-            return self._merge_lists(global_value, local_value)
+        if self.TOKEN.LIST == token_global == token_local:
+            return self._merge_lists(global_value, local_value)  # type: ignore[no-untyped-call]
 
-        else:
-            raise TypeError(
-                "Unsupported type of objects. GlobalType={}, LocalType={}".format(token_global, token_local)
-            )
+        raise TypeError(f"Unsupported type of objects. GlobalType={token_global}, LocalType={token_local}")
 
-    def _merge_lists(self, global_list, local_list):
+    def _merge_lists(self, global_list, local_list):  # type: ignore[no-untyped-def]
         """
         Merges the global list with the local list. List merging is simply a concatenation = global + local
 
@@ -387,7 +447,7 @@ class GlobalProperties(object):
 
         return global_list + local_list
 
-    def _merge_dict(self, global_dict, local_dict):
+    def _merge_dict(self, global_dict, local_dict):  # type: ignore[no-untyped-def]
         """
         Merges the two dictionaries together
 
@@ -399,11 +459,10 @@ class GlobalProperties(object):
         # Local has higher priority than global. So iterate over local dict and merge into global if keys are overridden
         global_dict = global_dict.copy()
 
-        for key in local_dict.keys():
-
+        for key in local_dict:
             if key in global_dict:
                 # Both local & global contains the same key. Let's do a merge.
-                global_dict[key] = self._do_merge(global_dict[key], local_dict[key])
+                global_dict[key] = self._do_merge(global_dict[key], local_dict[key])  # type: ignore[no-untyped-call]
 
             else:
                 # Key is not in globals, just in local. Copy it over
@@ -411,7 +470,7 @@ class GlobalProperties(object):
 
         return global_dict
 
-    def _prefer_local(self, global_value, local_value):
+    def _prefer_local(self, global_value, local_value):  # type: ignore[no-untyped-def]
         """
         Literally returns the local value whatever it may be. This method is useful to provide a unified implementation
         for cases that don't require special handling.
@@ -422,29 +481,26 @@ class GlobalProperties(object):
         """
         return local_value
 
-    def _token_of(self, input):
+    def _token_of(self, _input: Any) -> str:
         """
         Returns the token type of the input.
 
-        :param input: Input whose type is to be determined
+        :param _input: Input whose type is to be determined
         :return TOKENS: Token type of the input
         """
 
-        if isinstance(input, dict):
-
+        if isinstance(_input, dict):
             # Intrinsic functions are always dicts
-            if is_intrinsics(input):
+            if is_intrinsics(_input):
                 # Intrinsic functions are handled *exactly* like a primitive type because
                 # they resolve to a primitive type when creating a stack with CloudFormation
                 return self.TOKEN.PRIMITIVE
-            else:
-                return self.TOKEN.DICT
+            return self.TOKEN.DICT
 
-        elif isinstance(input, list):
+        if isinstance(_input, list):
             return self.TOKEN.LIST
 
-        else:
-            return self.TOKEN.PRIMITIVE
+        return self.TOKEN.PRIMITIVE
 
     class TOKEN:
         """
@@ -456,17 +512,17 @@ class GlobalProperties(object):
         LIST = "list"
 
 
-class InvalidGlobalsSectionException(Exception):
-    """Exception raised when a Globals section is is invalid.
+class InvalidGlobalsSectionException(ExceptionWithMessage):
+    """Exception raised when a Globals section is invalid.
 
     Attributes:
         message -- explanation of the error
     """
 
-    def __init__(self, logical_id, message):
+    def __init__(self, logical_id, message) -> None:  # type: ignore[no-untyped-def]
         self._logical_id = logical_id
         self._message = message
 
     @property
-    def message(self):
-        return "'{}' section is invalid. {}".format(self._logical_id, self._message)
+    def message(self) -> str:
+        return f"'{self._logical_id}' section is invalid. {self._message}"

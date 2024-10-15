@@ -1,6 +1,6 @@
 Resources:
   MyApiWithCognitoAuth:
-    Type: "AWS::Serverless::Api"
+    Type: AWS::Serverless::Api
     Properties:
       StageName: Prod
       Auth:
@@ -10,7 +10,7 @@ Resources:
             UserPoolArn: !GetAtt MyUserPool.Arn
 
   MyApiWithLambdaTokenAuth:
-    Type: "AWS::Serverless::Api"
+    Type: AWS::Serverless::Api
     Properties:
       StageName: Prod
       Auth:
@@ -20,7 +20,7 @@ Resources:
             FunctionArn: !GetAtt MyAuthFn.Arn
 
   MyApiWithLambdaRequestAuth:
-    Type: "AWS::Serverless::Api"
+    Type: AWS::Serverless::Api
     Properties:
       StageName: Prod
       Auth:
@@ -31,7 +31,21 @@ Resources:
             FunctionArn: !GetAtt MyAuthFn.Arn
             Identity:
               Headers:
-                - Authorization1
+              - Authorization1
+
+  MyApiWithNotCachedLambdaRequestAuth:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      Auth:
+        DefaultAuthorizer: MyLambdaRequestAuth
+        Authorizers:
+          MyLambdaRequestAuth:
+            FunctionPayloadType: REQUEST
+            FunctionArn: !GetAtt MyAuthFn.Arn
+            Identity:
+              ReauthorizeEvery: 0
+
   MyAuthFn:
     Type: AWS::Serverless::Function
     Properties:
@@ -51,18 +65,43 @@ Resources:
             RestApiId: !Ref MyApiWithCognitoAuth
             Method: get
             Path: /cognito
+        CognitoAnyMethod:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MyApiWithCognitoAuth
+            Method: any
+            Path: /any/cognito
         LambdaToken:
           Type: Api
           Properties:
             RestApiId: !Ref MyApiWithLambdaTokenAuth
             Method: get
             Path: /lambda-token
+        LambdaTokenAnyMethod:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MyApiWithLambdaTokenAuth
+            Method: any
+            Path: /any/lambda-token
         LambdaRequest:
           Type: Api
           Properties:
             RestApiId: !Ref MyApiWithLambdaRequestAuth
             Method: get
             Path: /lambda-request
+        LambdaRequestAnyMethod:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MyApiWithLambdaRequestAuth
+            Method: any
+            Path: /any/lambda-request
+        LambdaNotCachedRequest:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MyApiWithNotCachedLambdaRequestAuth
+            Method: get
+            Path: /not-cached-lambda-request
+
   MyUserPool:
     Type: AWS::Cognito::UserPool
     Properties:
@@ -71,8 +110,8 @@ Resources:
         PasswordPolicy:
           MinimumLength: 8
       UsernameAttributes:
-        - email
+      - email
       Schema:
-        - AttributeDataType: String
-          Name: email
-          Required: false
+      - AttributeDataType: String
+        Name: email
+        Required: false

@@ -17,11 +17,10 @@ We love features that help developers build serverless applications faster and f
 
 1. Scan through the list
    of
-   [feature requests](https://github.com/awslabs/serverless-application-model/labels/type/feature).
+   [feature requests](https://github.com/aws/serverless-application-model/discussions/categories/ideas).
    If you find your feature there, mark it +1. This is a good indication of
    interest from the community.
-2. If you don't find your feature in our backlog, create a new issue and assign
-   the `Feature Request` label to it.
+2. If you don't find your feature in our backlog, [create a new discussion](https://github.com/aws/serverless-application-model/discussions/new?category=ideas) for it.
 
 Keep in mind that features should be driven by real use cases. Answer the
 following questions in the issue that you create:
@@ -125,7 +124,7 @@ This project has adopted the [Amazon Open Source Code of Conduct](https://aws.gi
 
 ## Security issue notifications
 
-If you discover a potential security issue in this project we ask that you notify AWS/Amazon Security via our [vulnerability reporting page](http://aws.amazon.com/security/vulnerability-reporting/). Please do **not** create a public github issue.
+If you discover a potential security issue in this project we ask that you notify AWS/Amazon Security via our [vulnerability reporting page](http://aws.amazon.com/security/vulnerability-reporting/). Please do **not** create a public GitHub issue.
 
 ## Licensing
 

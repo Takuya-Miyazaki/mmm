@@ -1,32 +1,69 @@
-from samtranslator.model import PropertyType, Resource
-from samtranslator.model.types import is_type, one_of, is_str, list_of, any_type
+from typing import Any, Dict, List, Optional, Union
+
+from samtranslator.model import GeneratedProperty, Resource
 from samtranslator.model.intrinsics import fnGetAtt, ref
+from samtranslator.utils.types import Intrinsicable
+
+LAMBDA_TRACING_CONFIG_DISABLED = "Disabled"
 
 
 class LambdaFunction(Resource):
     resource_type = "AWS::Lambda::Function"
     property_types = {
-        "Code": PropertyType(True, is_type(dict)),
-        "PackageType": PropertyType(False, is_str()),
-        "DeadLetterConfig": PropertyType(False, is_type(dict)),
-        "Description": PropertyType(False, is_str()),
-        "FunctionName": PropertyType(False, is_str()),
-        "Handler": PropertyType(False, is_str()),
-        "MemorySize": PropertyType(False, is_type(int)),
-        "Role": PropertyType(False, is_str()),
-        "Runtime": PropertyType(False, is_str()),
-        "Timeout": PropertyType(False, is_type(int)),
-        "VpcConfig": PropertyType(False, is_type(dict)),
-        "Environment": PropertyType(False, is_type(dict)),
-        "Tags": PropertyType(False, list_of(is_type(dict))),
-        "TracingConfig": PropertyType(False, is_type(dict)),
-        "KmsKeyArn": PropertyType(False, one_of(is_type(dict), is_str())),
-        "Layers": PropertyType(False, list_of(one_of(is_str(), is_type(dict)))),
-        "ReservedConcurrentExecutions": PropertyType(False, any_type()),
-        "FileSystemConfigs": PropertyType(False, list_of(is_type(dict))),
-        "CodeSigningConfigArn": PropertyType(False, is_str()),
-        "ImageConfig": PropertyType(False, is_type(dict)),
+        "Code": GeneratedProperty(),
+        "PackageType": GeneratedProperty(),
+        "DeadLetterConfig": GeneratedProperty(),
+        "Description": GeneratedProperty(),
+        "FunctionName": GeneratedProperty(),
+        "Handler": GeneratedProperty(),
+        "MemorySize": GeneratedProperty(),
+        "Role": GeneratedProperty(),
+        "Runtime": GeneratedProperty(),
+        "Timeout": GeneratedProperty(),
+        "VpcConfig": GeneratedProperty(),
+        "Environment": GeneratedProperty(),
+        "Tags": GeneratedProperty(),
+        "TracingConfig": GeneratedProperty(),
+        "KmsKeyArn": GeneratedProperty(),
+        "Layers": GeneratedProperty(),
+        "ReservedConcurrentExecutions": GeneratedProperty(),
+        "FileSystemConfigs": GeneratedProperty(),
+        "CodeSigningConfigArn": GeneratedProperty(),
+        "ImageConfig": GeneratedProperty(),
+        "Architectures": GeneratedProperty(),
+        "SnapStart": GeneratedProperty(),
+        "EphemeralStorage": GeneratedProperty(),
+        "RuntimeManagementConfig": GeneratedProperty(),
+        "LoggingConfig": GeneratedProperty(),
+        "RecursiveLoop": GeneratedProperty(),
     }
+
+    Code: Dict[str, Any]
+    PackageType: Optional[str]
+    DeadLetterConfig: Optional[Dict[str, Any]]
+    Description: Optional[Intrinsicable[str]]
+    FunctionName: Optional[Intrinsicable[str]]
+    Handler: Optional[str]
+    MemorySize: Optional[Intrinsicable[int]]
+    Role: Optional[Intrinsicable[str]]
+    Runtime: Optional[str]
+    Timeout: Optional[Intrinsicable[int]]
+    VpcConfig: Optional[Dict[str, Any]]
+    Environment: Optional[Dict[str, Any]]
+    Tags: Optional[List[Dict[str, Any]]]
+    TracingConfig: Optional[Dict[str, Any]]
+    KmsKeyArn: Optional[Intrinsicable[str]]
+    Layers: Optional[List[Any]]
+    ReservedConcurrentExecutions: Optional[Any]
+    FileSystemConfigs: Optional[Dict[str, Any]]
+    CodeSigningConfigArn: Optional[Intrinsicable[str]]
+    ImageConfig: Optional[Dict[str, Any]]
+    Architectures: Optional[List[Any]]
+    SnapStart: Optional[Dict[str, Any]]
+    EphemeralStorage: Optional[Dict[str, Any]]
+    RuntimeManagementConfig: Optional[Dict[str, Any]]
+    LoggingConfig: Optional[Dict[str, Any]]
+    RecursiveLoop: Optional[str]
 
     runtime_attrs = {"name": lambda self: ref(self.logical_id), "arn": lambda self: fnGetAtt(self.logical_id, "Arn")}
 
@@ -34,9 +71,9 @@ class LambdaFunction(Resource):
 class LambdaVersion(Resource):
     resource_type = "AWS::Lambda::Version"
     property_types = {
-        "CodeSha256": PropertyType(False, is_str()),
-        "Description": PropertyType(False, is_str()),
-        "FunctionName": PropertyType(True, one_of(is_str(), is_type(dict))),
+        "CodeSha256": GeneratedProperty(),
+        "Description": GeneratedProperty(),
+        "FunctionName": GeneratedProperty(),
     }
 
     runtime_attrs = {
@@ -48,11 +85,11 @@ class LambdaVersion(Resource):
 class LambdaAlias(Resource):
     resource_type = "AWS::Lambda::Alias"
     property_types = {
-        "Description": PropertyType(False, is_str()),
-        "Name": PropertyType(False, is_str()),
-        "FunctionName": PropertyType(True, one_of(is_str(), is_type(dict))),
-        "FunctionVersion": PropertyType(True, one_of(is_str(), is_type(dict))),
-        "ProvisionedConcurrencyConfig": PropertyType(False, is_type(dict)),
+        "Description": GeneratedProperty(),
+        "Name": GeneratedProperty(),
+        "FunctionName": GeneratedProperty(),
+        "FunctionVersion": GeneratedProperty(),
+        "ProvisionedConcurrencyConfig": GeneratedProperty(),
     }
 
     runtime_attrs = {"arn": lambda self: ref(self.logical_id)}
@@ -61,20 +98,30 @@ class LambdaAlias(Resource):
 class LambdaEventSourceMapping(Resource):
     resource_type = "AWS::Lambda::EventSourceMapping"
     property_types = {
-        "BatchSize": PropertyType(False, is_type(int)),
-        "Enabled": PropertyType(False, is_type(bool)),
-        "EventSourceArn": PropertyType(True, is_str()),
-        "FunctionName": PropertyType(True, is_str()),
-        "MaximumBatchingWindowInSeconds": PropertyType(False, is_type(int)),
-        "MaximumRetryAttempts": PropertyType(False, is_type(int)),
-        "BisectBatchOnFunctionError": PropertyType(False, is_type(bool)),
-        "MaximumRecordAgeInSeconds": PropertyType(False, is_type(int)),
-        "DestinationConfig": PropertyType(False, is_type(dict)),
-        "ParallelizationFactor": PropertyType(False, is_type(int)),
-        "StartingPosition": PropertyType(False, is_str()),
-        "Topics": PropertyType(False, is_type(list)),
-        "Queues": PropertyType(False, is_type(list)),
-        "SourceAccessConfigurations": PropertyType(False, is_type(list)),
+        "BatchSize": GeneratedProperty(),
+        "DocumentDBEventSourceConfig": GeneratedProperty(),
+        "Enabled": GeneratedProperty(),
+        "EventSourceArn": GeneratedProperty(),
+        "FunctionName": GeneratedProperty(),
+        "MaximumBatchingWindowInSeconds": GeneratedProperty(),
+        "MaximumRetryAttempts": GeneratedProperty(),
+        "BisectBatchOnFunctionError": GeneratedProperty(),
+        "MaximumRecordAgeInSeconds": GeneratedProperty(),
+        "DestinationConfig": GeneratedProperty(),
+        "ParallelizationFactor": GeneratedProperty(),
+        "StartingPosition": GeneratedProperty(),
+        "StartingPositionTimestamp": GeneratedProperty(),
+        "Topics": GeneratedProperty(),
+        "Queues": GeneratedProperty(),
+        "SourceAccessConfigurations": GeneratedProperty(),
+        "TumblingWindowInSeconds": GeneratedProperty(),
+        "FunctionResponseTypes": GeneratedProperty(),
+        "SelfManagedEventSource": GeneratedProperty(),
+        "FilterCriteria": GeneratedProperty(),
+        "KmsKeyArn": GeneratedProperty(),
+        "AmazonManagedKafkaEventSourceConfig": GeneratedProperty(),
+        "SelfManagedKafkaEventSourceConfig": GeneratedProperty(),
+        "ScalingConfig": GeneratedProperty(),
     }
 
     runtime_attrs = {"name": lambda self: ref(self.logical_id)}
@@ -83,23 +130,24 @@ class LambdaEventSourceMapping(Resource):
 class LambdaPermission(Resource):
     resource_type = "AWS::Lambda::Permission"
     property_types = {
-        "Action": PropertyType(True, is_str()),
-        "FunctionName": PropertyType(True, is_str()),
-        "Principal": PropertyType(True, is_str()),
-        "SourceAccount": PropertyType(False, is_str()),
-        "SourceArn": PropertyType(False, is_str()),
-        "EventSourceToken": PropertyType(False, is_str()),
+        "Action": GeneratedProperty(),
+        "FunctionName": GeneratedProperty(),
+        "Principal": GeneratedProperty(),
+        "SourceAccount": GeneratedProperty(),
+        "SourceArn": GeneratedProperty(),
+        "EventSourceToken": GeneratedProperty(),
+        "FunctionUrlAuthType": GeneratedProperty(),
     }
 
 
 class LambdaEventInvokeConfig(Resource):
     resource_type = "AWS::Lambda::EventInvokeConfig"
     property_types = {
-        "DestinationConfig": PropertyType(False, is_type(dict)),
-        "FunctionName": PropertyType(True, is_str()),
-        "MaximumEventAgeInSeconds": PropertyType(False, is_type(int)),
-        "MaximumRetryAttempts": PropertyType(False, is_type(int)),
-        "Qualifier": PropertyType(True, is_str()),
+        "DestinationConfig": GeneratedProperty(),
+        "FunctionName": GeneratedProperty(),
+        "MaximumEventAgeInSeconds": GeneratedProperty(),
+        "MaximumRetryAttempts": GeneratedProperty(),
+        "Qualifier": GeneratedProperty(),
     }
 
 
@@ -108,11 +156,29 @@ class LambdaLayerVersion(Resource):
 
     resource_type = "AWS::Lambda::LayerVersion"
     property_types = {
-        "Content": PropertyType(True, is_type(dict)),
-        "Description": PropertyType(False, is_str()),
-        "LayerName": PropertyType(False, is_str()),
-        "CompatibleRuntimes": PropertyType(False, list_of(one_of(is_str(), is_type(dict)))),
-        "LicenseInfo": PropertyType(False, is_str()),
+        "Content": GeneratedProperty(),
+        "Description": GeneratedProperty(),
+        "LayerName": GeneratedProperty(),
+        "CompatibleArchitectures": GeneratedProperty(),
+        "CompatibleRuntimes": GeneratedProperty(),
+        "LicenseInfo": GeneratedProperty(),
     }
 
+    Content: Dict[str, Any]
+    Description: Optional[Intrinsicable[str]]
+    LayerName: Optional[Intrinsicable[str]]
+    CompatibleArchitectures: Optional[List[Union[str, Dict[str, Any]]]]
+    CompatibleRuntimes: Optional[List[Union[str, Dict[str, Any]]]]
+    LicenseInfo: Optional[Intrinsicable[str]]
+
     runtime_attrs = {"name": lambda self: ref(self.logical_id), "arn": lambda self: fnGetAtt(self.logical_id, "Arn")}
+
+
+class LambdaUrl(Resource):
+    resource_type = "AWS::Lambda::Url"
+    property_types = {
+        "TargetFunctionArn": GeneratedProperty(),
+        "AuthType": GeneratedProperty(),
+        "Cors": GeneratedProperty(),
+        "InvokeMode": GeneratedProperty(),
+    }

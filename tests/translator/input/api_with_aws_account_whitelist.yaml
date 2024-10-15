@@ -18,11 +18,16 @@ Resources:
           Properties:
             Auth:
               ResourcePolicy:
-                AwsAccountWhitelist: [
-                  "12345"
-                ]
-                AwsAccountBlacklist: [
-                  "67890"
-                ]
+                AwsAccountWhitelist: ['12345']
+                AwsAccountBlacklist: ['67890']
             Method: Put
             Path: /get
+        Any:
+          Type: Api
+          Properties:
+            Auth:
+              ResourcePolicy:
+                AwsAccountWhitelist: ['12345']
+                AwsAccountBlacklist: ['67890']
+            Method: any
+            Path: /any

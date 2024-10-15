@@ -1,13 +1,11 @@
 from unittest import TestCase
-from six import assertCountEqual
 
-from samtranslator.sdk.template import SamTemplate
 from samtranslator.sdk.resource import SamResource
+from samtranslator.sdk.template import SamTemplate
 
 
 class TestSamTemplate(TestCase):
     def setUp(self):
-
         self.template_dict = {
             "Properties": {"c": "d"},
             "Metadata": {"a": "b"},
@@ -31,10 +29,9 @@ class TestSamTemplate(TestCase):
         ]
 
         actual = [(id, resource.to_dict()) for id, resource in template.iterate()]
-        assertCountEqual(self, expected, actual)
+        self.assertCountEqual(expected, actual)
 
     def test_iterate_must_filter_by_resource_type(self):
-
         template = SamTemplate(self.template_dict)
 
         type = "AWS::Serverless::Function"

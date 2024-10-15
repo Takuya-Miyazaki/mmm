@@ -1,10 +1,11 @@
-import pytest
-
+from typing import Any, List
 from unittest import TestCase
-from mock import Mock, call, ANY
-from samtranslator.model.exceptions import InvalidResourceException
-from samtranslator.model import PropertyType, Resource, SamResourceMacro, ResourceTypeResolver
+from unittest.mock import Mock
+
+import pytest
 from samtranslator.intrinsics.resource_refs import SupportedResourceReferences
+from samtranslator.model import PropertyType, Resource, ResourceTypeResolver, SamResourceMacro
+from samtranslator.model.exceptions import InvalidResourceException
 from samtranslator.plugins import LifeCycleEvents
 
 
@@ -79,17 +80,13 @@ def test_resource_type_validation(logical_id, resource_dict, expected_exception)
         for name, value in resource_dict["Properties"].items():
             assert (
                 getattr(resource, name) == value
-            ), "resource did not have expected property attribute {property_name} with value {property_value}".format(
-                property_name=name, property_value=value
-            )
+            ), f"resource did not have expected property attribute {name} with value {value}"
 
         actual_to_dict = resource.to_dict()
         expected_to_dict = {"id": resource_dict}
         assert (
             actual_to_dict == expected_to_dict
-        ), "to_dict() returned different values from what was passed to from_dict(); expected {expected}, got {actual}".format(
-            expected=expected_to_dict, actual=actual_to_dict
-        )
+        ), f"to_dict() returned different values from what was passed to from_dict(); expected {expected_to_dict}, got {actual_to_dict}"
     else:
         with pytest.raises(expected_exception):
             resource = DummyResource.from_dict(logical_id, resource_dict)
@@ -107,6 +104,15 @@ class TestResourceAttributes(TestCase):
         dict_with_attributes = {
             "id": {"Type": "foo", "Properties": {}, "UpdatePolicy": "update", "DeletionPolicy": {"foo": "bar"}}
         }
+        dict_with_attributes2 = {
+            "id": {
+                "Type": "foo",
+                "Properties": {},
+                "UpdateReplacePolicy": "update",
+                "Metadata": {"foo": "bar"},
+                "Condition": "con",
+            }
+        }
 
         r = self.MyResource("id")
         self.assertEqual(r.to_dict(), empty_resource_dict)
@@ -114,9 +120,13 @@ class TestResourceAttributes(TestCase):
         r = self.MyResource("id", attributes={"UpdatePolicy": "update", "DeletionPolicy": {"foo": "bar"}})
         self.assertEqual(r.to_dict(), dict_with_attributes)
 
-    def test_invalid_attr(self):
+        r = self.MyResource(
+            "id", attributes={"UpdateReplacePolicy": "update", "Metadata": {"foo": "bar"}, "Condition": "con"}
+        )
+        self.assertEqual(r.to_dict(), dict_with_attributes2)
 
-        with pytest.raises(KeyError) as ex:
+    def test_invalid_attr(self):
+        with pytest.raises(KeyError):
             # Unsupported attributes cannot be added to the resource
             self.MyResource("id", attributes={"foo": "bar"})
 
@@ -140,6 +150,9 @@ class TestResourceAttributes(TestCase):
             "Properties": {},
             "UpdatePolicy": "update",
             "DeletionPolicy": [1, 2, 3],
+            "UpdateReplacePolicy": "update",
+            "Metadata": {"foo": "bar"},
+            "Condition": "con",
         }
 
         r = self.MyResource.from_dict("id", resource_dict=no_attribute)
@@ -148,6 +161,9 @@ class TestResourceAttributes(TestCase):
         r = self.MyResource.from_dict("id", resource_dict=all_supported_attributes)
         self.assertEqual(r.get_resource_attribute("DeletionPolicy"), [1, 2, 3])
         self.assertEqual(r.get_resource_attribute("UpdatePolicy"), "update")
+        self.assertEqual(r.get_resource_attribute("UpdateReplacePolicy"), "update")
+        self.assertEqual(r.get_resource_attribute("Metadata"), {"foo": "bar"})
+        self.assertEqual(r.get_resource_attribute("Condition"), "con")
 
 
 class TestResourceRuntimeAttributes(TestCase):
@@ -165,7 +181,7 @@ class TestResourceRuntimeAttributes(TestCase):
         self.assertEqual("value1", resource.get_runtime_attr("attr1"))
         self.assertEqual("value2", resource.get_runtime_attr("attr2"))
 
-        with self.assertRaises(NotImplementedError):
+        with self.assertRaises(KeyError):
             resource.get_runtime_attr("invalid_attribute")
 
     def test_resource_default_runtime_attributes(self):
@@ -200,6 +216,9 @@ class TestSamResourceReferableProperties(TestCase):
             property_types = {}
             referable_properties = {"prop1": "resource_type1", "prop2": "resource_type2", "prop3": "resource_type3"}
 
+            def to_cloudformation(self, **kwargs: Any) -> List[Any]:
+                return []
+
         sam_resource = NewSamResource("SamLogicalId")
 
         cfn_resources = [self.ResourceType1("logicalId1"), self.ResourceType2("logicalId2")]
@@ -220,6 +239,9 @@ class TestSamResourceReferableProperties(TestCase):
             resource_type = "foo"
             property_types = {}
             referable_properties = {"prop1": "resource_type1", "prop2": "resource_type2", "prop3": "resource_type3"}
+
+            def to_cloudformation(self, **kwargs: Any) -> List[Any]:
+                return []
 
         sam_resource1 = NewSamResource("SamLogicalId1")
         sam_resource2 = NewSamResource("SamLogicalId2")
@@ -247,6 +269,9 @@ class TestSamResourceReferableProperties(TestCase):
             property_types = {}
             referable_properties = {"prop1": "foo", "prop2": "bar"}
 
+            def to_cloudformation(self, **kwargs: Any) -> List[Any]:
+                return []
+
         sam_resource = NewSamResource("SamLogicalId")
 
         # None of the CFN resource types are in the referable list
@@ -262,6 +287,9 @@ class TestSamResourceReferableProperties(TestCase):
             property_types = {}
             referable_properties = {}
 
+            def to_cloudformation(self, **kwargs: Any) -> List[Any]:
+                return []
+
         sam_resource = NewSamResource("SamLogicalId")
 
         cfn_resources = [self.ResourceType1("logicalId1"), self.ResourceType2("logicalId2")]
@@ -276,6 +304,9 @@ class TestSamResourceReferableProperties(TestCase):
             property_types = {}
             referable_properties = {"prop1": "resource_type1"}
 
+            def to_cloudformation(self, **kwargs: Any) -> List[Any]:
+                return []
+
         sam_resource = NewSamResource("SamLogicalId")
 
         cfn_resources = []
@@ -289,6 +320,9 @@ class TestSamResourceReferableProperties(TestCase):
             resource_type = "foo"
             property_types = {}
             referable_properties = {"prop1": "resource_type1"}
+
+            def to_cloudformation(self, **kwargs: Any) -> List[Any]:
+                return []
 
         sam_resource = NewSamResource("SamLogicalId")
 
